@@ -1,0 +1,73 @@
+{
+  "title": "2024년 세분류 토지피복 SHP",
+  "bounds": [
+    [
+      37.52498946575684,
+      126.95001672498321
+    ],
+    [
+      37.60000796630012,
+      127.02502508910416
+    ]
+  ],
+  "source_crs": "PROJCS[\"PCS_ITRF2000_TM\",GEOGCS[\"ITRF2000\",DATUM[\"International_Terrestrial_Reference_Frame_2000\",SPHEROID[\"GRS 1980\",6378137,298.257222101,AUTHORITY[\"EPSG\",\"7019\"]],AUTHORITY[\"EPSG\",\"6656\"]],PRIMEM[\"Greenwich\",0],UNIT[\"Degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",38],PARAMETER[\"central_meridian\",127],PARAMETER[\"scale_factor\",1],PARAMETER[\"false_easting\",200000],PARAMETER[\"false_northing\",600000],UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],AXIS[\"Easting\",EAST],AXIS[\"Northing\",NORTH]]",
+  "meters_per_pixel": 2.0,
+  "image_size": [
+    3315,
+    4163
+  ],
+  "source_files": [
+    "37608069.shp",
+    "37608070.shp",
+    "37608079.shp",
+    "37608080.shp",
+    "37705061.shp",
+    "37705071.shp",
+    "37705081.shp"
+  ],
+  "polygon_count": 97018,
+  "legend": [
+    {
+      "code": "100",
+      "name": "시가화건조지역",
+      "color": "#e63946",
+      "count": 89578
+    },
+    {
+      "code": "200",
+      "name": "농업지역",
+      "color": "#f48930",
+      "count": 260
+    },
+    {
+      "code": "300",
+      "name": "산림지역",
+      "color": "#f2d548",
+      "count": 672
+    },
+    {
+      "code": "400",
+      "name": "초지",
+      "color": "#48a05c",
+      "count": 5276
+    },
+    {
+      "code": "500",
+      "name": "습지",
+      "color": "#2fb5aa",
+      "count": 40
+    },
+    {
+      "code": "600",
+      "name": "나지",
+      "color": "#3475c7",
+      "count": 1104
+    },
+    {
+      "code": "700",
+      "name": "수역",
+      "color": "#8b5cf6",
+      "count": 88
+    }
+  ]
+}

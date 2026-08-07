@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
+import json
 from pathlib import Path
 
 import folium
@@ -58,6 +59,7 @@ METRICS = {
 }
 
 PLACES = {
+    "SHP 영역": ([37.5625, 126.9875], 13),
     "서울": ([37.5665, 126.9780], 11),
     "전국": ([36.35, 127.75], 7),
     "수도권": ([37.50, 127.00], 10),
@@ -77,6 +79,8 @@ WMS_URL = "https://api.mcee.go.kr/geoserver/gwc/service/wms"
 LAND_COVER_SOURCE = "https://aid.mcee.go.kr/api/land.do"
 SDOT_SOURCE = "https://data.seoul.go.kr/dataList/OA-22833/A/1/datasetView.do"
 DATA_FILE_NAME = "sdot_nature_20260720_20260726.parquet"
+SHP_IMAGE_FILE_NAME = "landcover_detail_2024.png"
+SHP_META_FILE_NAME = "landcover_detail_2024.json"
 
 
 def find_data_path() -> Path | None:
@@ -88,9 +92,20 @@ def find_data_path() -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
 
+def find_asset(file_name: str) -> Path | None:
+    app_dir = Path(__file__).resolve().parent
+    candidates = (app_dir / file_name, app_dir / "data" / file_name)
+    return next((path for path in candidates if path.is_file()), None)
+
+
 @st.cache_data(show_spinner="S-DoT 데이터를 불러오는 중입니다…")
 def load_sdot_data(data_path: str) -> pd.DataFrame:
     return pd.read_parquet(data_path)
+
+
+@st.cache_data(show_spinner=False)
+def load_json(path: str) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def build_base_map(
@@ -185,6 +200,40 @@ def add_sdot_layer(map_object: folium.Map, data: pd.DataFrame, metric: Metric) -
         color_scale.add_to(map_object)
 
 
+def add_shp_overlay(
+    map_object: folium.Map,
+    image_path: Path,
+    metadata: dict,
+    opacity: float,
+) -> None:
+    folium.raster_layers.ImageOverlay(
+        image=str(image_path),
+        bounds=metadata["bounds"],
+        name="SHP · 2024 세분류 토지피복",
+        opacity=opacity,
+        interactive=True,
+        cross_origin=False,
+        zindex=2,
+        pixelated=False,
+        show=True,
+    ).add_to(map_object)
+
+    legend_rows = "".join(
+        f'<div><span style="display:inline-block;width:11px;height:11px;'
+        f'background:{item["color"]};margin-right:6px;border-radius:2px"></span>'
+        f'{escape(str(item["name"]))}</div>'
+        for item in metadata["legend"]
+    )
+    legend_html = f"""
+    <div style="position:fixed;left:12px;bottom:28px;z-index:9999;background:rgba(255,255,255,.92);
+                color:#18201e;padding:9px 11px;border-radius:7px;border:1px solid #cdd6d2;
+                font:12px/1.5 sans-serif;box-shadow:0 1px 5px rgba(0,0,0,.18)">
+      <b>2024 SHP 대분류</b>{legend_rows}
+    </div>
+    """
+    map_object.get_root().html.add_child(folium.Element(legend_html))
+
+
 st.markdown(
     """
     <style>
@@ -199,10 +248,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="map-kicker">LAND COVER × SEOUL URBAN SENSOR</div>', unsafe_allow_html=True)
-st.title("토지피복 · S-DoT 환경지도")
+st.markdown('<div class="map-kicker">WMS × SHAPEFILE × SEOUL URBAN SENSOR</div>', unsafe_allow_html=True)
+st.title("토지피복 · SHP · S-DoT 통합지도")
 st.markdown(
-    '<p class="map-subtitle">환경공간정보서비스 토지피복 위에서 서울 도시데이터 센서 측정값을 탐색합니다.</p>',
+    '<p class="map-subtitle">토지피복 SHP와 서울 도시데이터 센서 포인트를 한 지도에서 비교합니다.</p>',
     unsafe_allow_html=True,
 )
 
@@ -216,6 +265,15 @@ with st.sidebar:
     selected_place = st.selectbox("빠른 이동", list(PLACES), index=0)
     selected_basemap = st.selectbox("배경지도", list(BASEMAPS), index=1)
     selected_opacity = st.slider("토지피복 투명도", 0.1, 1.0, 0.65, 0.05)
+
+    st.divider()
+    st.subheader("세분류 SHP")
+    show_shp = st.toggle("2024 SHP 레이어 표시", value=True)
+    shp_opacity = st.slider("SHP 투명도", 0.1, 1.0, 0.72, 0.05, disabled=not show_shp)
+    shp_image_path = find_asset(SHP_IMAGE_FILE_NAME)
+    shp_meta_path = find_asset(SHP_META_FILE_NAME)
+    if show_shp and (shp_image_path is None or shp_meta_path is None):
+        st.warning("SHP 오버레이 파일 2개가 저장소에 없습니다.")
 
     st.divider()
     st.subheader("S-DoT 센서")
@@ -277,12 +335,24 @@ map_object = build_base_map(
     opacity=selected_opacity,
 )
 
+if show_shp and shp_image_path is not None and shp_meta_path is not None:
+    shp_metadata = load_json(str(shp_meta_path))
+    add_shp_overlay(map_object, shp_image_path, shp_metadata, shp_opacity)
+
 if show_sdot and sdot_snapshot is not None and selected_metric is not None:
     add_sdot_layer(map_object, sdot_snapshot, selected_metric)
 
 folium.LayerControl(collapsed=False, position="topright").add_to(map_object)
 
-map_key_parts = [selected_period, selected_place, selected_basemap, str(selected_opacity), str(show_sdot)]
+map_key_parts = [
+    selected_period,
+    selected_place,
+    selected_basemap,
+    str(selected_opacity),
+    str(show_shp),
+    str(shp_opacity),
+    str(show_sdot),
+]
 if selected_timestamp is not None and selected_metric is not None:
     snapshot_size = len(sdot_snapshot) if sdot_snapshot is not None else 0
     map_key_parts.extend([str(selected_timestamp), selected_metric.column, str(snapshot_size)])
@@ -299,6 +369,7 @@ with st.expander("데이터 및 이용 안내"):
     st.markdown(
         f"""
         - **토지피복 레이어:** `{selected_layer.layer_name}` / EPSG:3857
+        - **SHP:** 7개 원본 파일, 97,018개 세분류 폴리곤, 약 2m 래스터 해상도
         - **S-DoT 기간:** 2026-07-20 00:07 ~ 2026-07-26 23:07
         - **S-DoT 규모:** 149,419건, 설치위치가 확인된 센서 954개
         - **토지피복 출처:** [기후에너지환경부 환경공간정보서비스]({LAND_COVER_SOURCE})
@@ -310,4 +381,4 @@ with st.expander("데이터 및 이용 안내"):
         """
     )
 
-st.caption("자료 출처: 기후에너지환경부 환경공간정보서비스 · 서울특별시 서울열린데이터광장")
+st.caption("자료 출처: 기후에너지환경부 환경공간정보서비스 · 사용자 제공 2024 SHP · 서울특별시 서울열린데이터광장")

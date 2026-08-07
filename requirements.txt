@@ -3,3 +3,4 @@ folium>=0.17,<1
 streamlit-folium>=0.22,<1
 pandas>=2.2,<4
 pyarrow>=15,<25
+pillow>=10,<13
