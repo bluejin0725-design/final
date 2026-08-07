@@ -76,12 +76,21 @@ BASEMAPS = {
 WMS_URL = "https://api.mcee.go.kr/geoserver/gwc/service/wms"
 LAND_COVER_SOURCE = "https://aid.mcee.go.kr/api/land.do"
 SDOT_SOURCE = "https://data.seoul.go.kr/dataList/OA-22833/A/1/datasetView.do"
-DATA_PATH = Path(__file__).parent / "data" / "sdot_nature_20260720_20260726.parquet"
+DATA_FILE_NAME = "sdot_nature_20260720_20260726.parquet"
+
+
+def find_data_path() -> Path | None:
+    app_dir = Path(__file__).resolve().parent
+    candidates = (
+        app_dir / DATA_FILE_NAME,
+        app_dir / "data" / DATA_FILE_NAME,
+    )
+    return next((path for path in candidates if path.is_file()), None)
 
 
 @st.cache_data(show_spinner="S-DoT 데이터를 불러오는 중입니다…")
-def load_sdot_data() -> pd.DataFrame:
-    return pd.read_parquet(DATA_PATH)
+def load_sdot_data(data_path: str) -> pd.DataFrame:
+    return pd.read_parquet(data_path)
 
 
 def build_base_map(
@@ -213,7 +222,13 @@ with st.sidebar:
     show_sdot = st.toggle("S-DoT 레이어 표시", value=True)
 
     if show_sdot:
-        sdot_data = load_sdot_data()
+        data_path = find_data_path()
+        if data_path is None:
+            st.error("S-DoT 데이터 파일이 저장소에 없습니다.")
+            st.code(DATA_FILE_NAME)
+            st.info("위 파일을 app.py와 같은 폴더에 업로드한 뒤 앱을 재부팅해 주세요.")
+            st.stop()
+        sdot_data = load_sdot_data(str(data_path))
         selected_metric_name = st.selectbox("색상 기준 측정항목", list(METRICS), index=0)
         selected_metric = METRICS[selected_metric_name]
         timestamps = sorted(sdot_data["measured_at"].dropna().unique())

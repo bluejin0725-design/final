@@ -17,8 +17,7 @@
 ```text
 .
 ├── app.py
-├── data/
-│   └── sdot_nature_20260720_20260726.parquet
+├── sdot_nature_20260720_20260726.parquet
 ├── requirements.txt
 ├── README.md
 └── .gitignore
@@ -26,6 +25,9 @@
 
 원본 S-DoT CSV는 53MB이지만, 앱에 필요한 측정값과 공식 설치좌표만 보존한 압축
 Parquet 파일은 약 1MB입니다. 149,419개 측정행과 954개 센서의 전체 기간을 유지합니다.
+
+> **중요:** GitHub에 업로드할 때 `app.py`와
+> `sdot_nature_20260720_20260726.parquet`를 반드시 같은 폴더에 넣어야 합니다.
 
 ## 로컬 실행
 
