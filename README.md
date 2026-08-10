@@ -1,4 +1,4 @@
-# 토지피복 · SHP · S-DoT 통합지도
+# 토지피복 · S-DoT 300m 버퍼 분석
 
 기후에너지환경부 환경공간정보서비스 WMS 토지피복지도 위에 서울특별시 S-DoT
 환경센서 측정값을 표시하는 Streamlit 앱입니다.
@@ -9,6 +9,10 @@
 - S-DoT 레이어 ON/OFF 토글
 - 사용자 제공 2024년 세분류 토지피복 SHP 레이어 ON/OFF와 투명도 조절
 - SHP 7개, 97,018개 폴리곤을 약 2m 해상도 투명 오버레이로 경량화
+- S-DoT 954개 지점에 반경 300m 버퍼 생성
+- 버퍼별 대·중·세분류 토지피복 면적과 구성비 사전 계산
+- 우세 용도 색상 버퍼, 최소 SHP 피복률 필터, 센서 검색
+- 선택한 버퍼의 용도별 구성비 막대그래프와 면적 툴팁
 - 2026-07-20~07-26의 시간대별 측정값 탐색
 - 온도·습도·풍속·조도·자외선·소음·흑구온도·가스류 측정항목 선택
 - 자치구 필터와 측정값 기반 포인트 색상 표시
@@ -22,6 +26,8 @@
 ├── sdot_nature_20260720_20260726.parquet
 ├── landcover_detail_2024.png
 ├── landcover_detail_2024.json
+├── sdot_buffers_300m.geojson.gz
+├── sdot_buffer300m_landcover.parquet
 ├── requirements.txt
 ├── README.md
 └── .gitignore
@@ -35,6 +41,16 @@ Parquet 파일은 약 1MB입니다. 149,419개 측정행과 954개 센서의 전
 
 SHP 레이어를 표시하려면 `landcover_detail_2024.png`와 `landcover_detail_2024.json`도
 `app.py`와 같은 폴더에 업로드해야 합니다.
+
+300m 분석을 사용하려면 `sdot_buffers_300m.geojson.gz`와
+`sdot_buffer300m_landcover.parquet`도 같은 폴더에 업로드해야 합니다.
+
+## 버퍼 구성비 해석
+
+- 버퍼 면적은 S-DoT 위치를 기준으로 한 반경 300m 원입니다.
+- SHP 피복률은 전체 버퍼 면적 중 제공된 SHP와 겹치는 면적의 비율입니다.
+- 용도 구성비는 SHP로 피복된 면적을 100%로 두고 계산합니다.
+- 제공된 SHP 영역과 겹치는 센서는 126개이며, 101개는 피복률이 99% 이상입니다.
 
 ## 로컬 실행
 
