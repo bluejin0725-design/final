@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 from branca.colormap import LinearColormap
 from folium.plugins import Fullscreen, LocateControl
+from folium.utilities import JsCode
 from streamlit_folium import st_folium
 
 
@@ -156,6 +157,18 @@ def add_buffer_layer(
     dominant = level_stats.loc[
         dominant_indexes, ["serial", "class_code", "class_name", "share_pct"]
     ].set_index("serial")
+    composition_by_serial = {
+        str(serial): [
+            {
+                "name": escape(str(row.class_name)),
+                "share": round(float(row.share_pct), 2),
+                "color": class_color(str(row.class_code)),
+            }
+            for row in group.sort_values("share_pct", ascending=False).itertuples(index=False)
+            if float(row.share_pct) > 0
+        ]
+        for serial, group in level_stats.groupby("serial", sort=False)
+    }
 
     features = []
     for source_feature in buffer_geojson["features"]:
@@ -175,6 +188,8 @@ def add_buffer_layer(
                 "dominant_name": str(dominant_row["class_name"]),
                 "dominant_share": round(float(dominant_row["share_pct"]), 2),
                 "coverage_pct": round(coverage, 2),
+                "composition_level": level,
+                "composition": composition_by_serial.get(serial, []),
                 "selected": serial == selected_serial,
             }
         )
@@ -198,6 +213,52 @@ def add_buffer_layer(
             "dashArray": None if properties["coverage_pct"] >= 99 else "5 4",
         }
 
+    pie_tooltip = JsCode(
+        """
+        function(feature, layer) {
+            const properties = feature.properties || {};
+            const items = properties.composition || [];
+            let accumulated = 0;
+            const colorStops = items.map(function(item) {
+                const start = accumulated;
+                accumulated = Math.min(100, accumulated + Number(item.share || 0));
+                return item.color + " " + start.toFixed(2) + "% " + accumulated.toFixed(2) + "%";
+            });
+            const pieBackground = colorStops.length
+                ? "conic-gradient(" + colorStops.join(",") + ")"
+                : "#d1d5db";
+            const legendRows = items.map(function(item) {
+                return '<div style="display:grid;grid-template-columns:12px 1fr auto;gap:7px;'
+                    + 'align-items:center;margin:3px 0">'
+                    + '<span style="width:11px;height:11px;border-radius:2px;background:'
+                    + item.color + '"></span>'
+                    + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+                    + item.name + '</span>'
+                    + '<b style="font-variant-numeric:tabular-nums">'
+                    + Number(item.share).toFixed(1) + '%</b></div>';
+            }).join("");
+            const tooltipHtml = '<div style="width:310px;color:#18201e;font:12px/1.4 sans-serif">'
+                + '<div style="font-size:13px;font-weight:700;margin-bottom:7px">'
+                + properties.serial + ' · 300m ' + properties.composition_level + ' 구성비</div>'
+                + '<div style="display:grid;grid-template-columns:112px 1fr;gap:12px;align-items:center">'
+                + '<div style="width:108px;height:108px;border-radius:50%;background:'
+                + pieBackground + ';box-shadow:inset 0 0 0 1px rgba(0,0,0,.12)"></div>'
+                + '<div style="max-height:180px;overflow-y:auto;padding-right:3px">'
+                + legendRows + '</div></div>'
+                + '<div style="margin-top:7px;padding-top:6px;border-top:1px solid #d7dfdc;'
+                + 'color:#59635f">SHP 피복률 '
+                + Number(properties.coverage_pct).toFixed(1) + '%</div></div>';
+            layer.bindTooltip(tooltipHtml, {
+                sticky: true,
+                direction: "auto",
+                opacity: 0.97,
+                maxWidth: 350,
+                className: "landcover-pie-tooltip"
+            });
+        }
+        """
+    )
+
     folium.GeoJson(
         {"type": "FeatureCollection", "features": features},
         name="300m 버퍼",
@@ -205,15 +266,10 @@ def add_buffer_layer(
         highlight_function=lambda _: {"weight": 4, "fillOpacity": 0.30},
         show=True,
         control=False,
-        tooltip=folium.GeoJsonTooltip(
-            fields=["serial", "dominant_name", "dominant_share", "coverage_pct"],
-            aliases=["센서", "우세 용도", "우세 비율(%)", "SHP 피복률(%)"],
-            localize=True,
-            sticky=False,
-        ),
+        on_each_feature=pie_tooltip,
         popup=folium.GeoJsonPopup(
-            fields=["serial", "address", "dominant_name", "dominant_share", "coverage_pct"],
-            aliases=["센서", "주소", "우세 용도", "우세 비율(%)", "SHP 피복률(%)"],
+            fields=["serial", "address", "coverage_pct"],
+            aliases=["센서", "주소", "SHP 피복률(%)"],
             localize=True,
         ),
     ).add_to(parent_group)
@@ -225,6 +281,7 @@ def add_temperature_points(
     map_object: folium.Map,
     data: pd.DataFrame,
 ) -> None:
+    data = data.dropna(subset=[TEMPERATURE_COLUMN]).copy()
     measured = data[TEMPERATURE_COLUMN].dropna()
     if measured.empty:
         value_min, value_max = 0.0, 1.0
@@ -283,6 +340,7 @@ def build_sensor_table(
     snapshot: pd.DataFrame,
     min_coverage: float,
 ) -> tuple[pd.DataFrame, list[str]]:
+    snapshot = snapshot.dropna(subset=[TEMPERATURE_COLUMN]).copy()
     large_class = stats[stats["level"] == "대분류"].copy()
     large_class = large_class[large_class["coverage_pct"] >= min_coverage]
     composition = large_class.pivot_table(
@@ -470,6 +528,8 @@ with st.sidebar:
         sdot_snapshot = clean_temperature(
             sdot_snapshot.drop_duplicates("serial", keep="last")
         )
+        # 온도가 비어 있거나 유효범위를 벗어난 센서는 지도·버퍼·표·분석에서 제외합니다.
+        sdot_snapshot = sdot_snapshot.dropna(subset=[TEMPERATURE_COLUMN]).copy()
         allowed_serials = set(sdot_snapshot["serial"].astype(str))
 
         feature_lookup = {
