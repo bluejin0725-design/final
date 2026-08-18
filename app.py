@@ -9,6 +9,7 @@ from urllib.parse import quote
 import altair as alt
 import folium
 import pandas as pd
+import statsmodels.api as sm
 import streamlit as st
 from branca.colormap import LinearColormap
 from folium.plugins import Fullscreen, LocateControl
@@ -479,6 +480,98 @@ def build_trend_table(sensor_table: pd.DataFrame, composition_columns: list[str]
     return trend
 
 
+def build_dominant_use_regression(
+    sensor_table: pd.DataFrame,
+    min_group_size: int = 3,
+) -> tuple[pd.DataFrame | None, dict[str, object]]:
+    """우세용도 범주별 온도 차이를 기준집단 대비 OLS 계수로 추정합니다."""
+    valid = sensor_table[["우세 용도", "온도(℃)"]].dropna().copy()
+    valid["우세 용도"] = valid["우세 용도"].astype(str)
+    valid["온도(℃)"] = pd.to_numeric(valid["온도(℃)"], errors="coerce")
+    valid = valid.dropna(subset=["온도(℃)"])
+
+    group_counts = valid["우세 용도"].value_counts()
+    eligible_counts = group_counts[group_counts >= min_group_size]
+    excluded = group_counts[group_counts < min_group_size].to_dict()
+    if len(eligible_counts) < 2:
+        return None, {
+            "reason": f"센서가 {min_group_size}개 이상인 우세용도가 2개 이상 필요합니다.",
+            "excluded": excluded,
+        }
+
+    reference = str(eligible_counts.index[0])
+    categories = [reference, *sorted(str(item) for item in eligible_counts.index[1:])]
+    analysis = valid[valid["우세 용도"].isin(categories)].copy()
+
+    design = pd.DataFrame({"const": 1.0}, index=analysis.index)
+    parameter_names: dict[str, str] = {}
+    for index, category in enumerate(categories[1:], start=1):
+        parameter = f"dominant_use_{index}"
+        parameter_names[category] = parameter
+        design[parameter] = (analysis["우세 용도"] == category).astype(float)
+
+    model = sm.OLS(analysis["온도(℃)"].astype(float), design).fit(
+        cov_type="HC3",
+        use_t=True,
+    )
+    confidence = model.conf_int(alpha=0.05)
+    rows = []
+    for category in categories:
+        group = analysis[analysis["우세 용도"] == category]["온도(℃)"]
+        if category == reference:
+            coefficient = 0.0
+            standard_error = float("nan")
+            lower = float("nan")
+            upper = float("nan")
+            p_value = float("nan")
+            result = "기준집단"
+        else:
+            parameter = parameter_names[category]
+            coefficient = float(model.params[parameter])
+            standard_error = float(model.bse[parameter])
+            lower = float(confidence.loc[parameter, 0])
+            upper = float(confidence.loc[parameter, 1])
+            p_value = float(model.pvalues[parameter])
+            if p_value < 0.05:
+                result = "기준보다 유의하게 높음" if coefficient > 0 else "기준보다 유의하게 낮음"
+            else:
+                result = "유의한 차이 없음"
+        rows.append(
+            {
+                "우세용도": category,
+                "센서수": int(len(group)),
+                "평균온도(℃)": float(group.mean()),
+                "기준 대비 온도차(℃)": coefficient,
+                "표준오차": standard_error,
+                "95% 하한(℃)": lower,
+                "95% 상한(℃)": upper,
+                "p값": p_value,
+                "판정": result,
+            }
+        )
+
+    result_table = pd.DataFrame(rows)
+    numeric_columns = [
+        "평균온도(℃)",
+        "기준 대비 온도차(℃)",
+        "표준오차",
+        "95% 하한(℃)",
+        "95% 상한(℃)",
+        "p값",
+    ]
+    result_table[numeric_columns] = result_table[numeric_columns].round(4)
+    overall_p = float(model.f_pvalue) if pd.notna(model.f_pvalue) else float("nan")
+    return result_table, {
+        "reference": reference,
+        "nobs": int(model.nobs),
+        "r_squared": float(model.rsquared),
+        "adjusted_r_squared": float(model.rsquared_adj),
+        "overall_p": overall_p,
+        "excluded": excluded,
+        "min_group_size": min_group_size,
+    }
+
+
 st.markdown(
     """
     <style>
@@ -501,6 +594,7 @@ st.markdown(
 sdot_snapshot: pd.DataFrame | None = None
 buffer_stats: pd.DataFrame | None = None
 buffer_geojson: dict | None = None
+sensor_table: pd.DataFrame | None = None
 selected_buffer_serial: str | None = None
 selected_timestamp: pd.Timestamp | None = None
 buffer_level = "대분류"
@@ -814,3 +908,88 @@ with st.expander("데이터 및 분석 기준"):
     )
 
 st.caption("자료 출처: 사용자 제공 2024 토지피복 SHP · 서울특별시 서울열린데이터광장")
+
+st.divider()
+st.subheader("우세용도에 따른 온도 차이 OLS 회귀분석")
+if show_temperature_sensors and sensor_table is not None and not sensor_table.empty:
+    regression_table, regression_info = build_dominant_use_regression(sensor_table)
+    if regression_table is None:
+        st.warning(str(regression_info["reason"]))
+    else:
+        metric1, metric2, metric3, metric4 = st.columns(4)
+        metric1.metric("분석 센서", f"{int(regression_info['nobs']):,}개")
+        metric2.metric("기준 우세용도", str(regression_info["reference"]))
+        metric3.metric("설명력 R²", f"{float(regression_info['r_squared']):.3f}")
+        overall_p = float(regression_info["overall_p"])
+        metric4.metric("모형 전체 p값", f"{overall_p:.4f}" if pd.notna(overall_p) else "계산 불가")
+
+        coefficient_data = regression_table[
+            (regression_table["판정"] != "기준집단")
+            & regression_table["기준 대비 온도차(℃)"].notna()
+        ].copy()
+        coefficient_data = coefficient_data.sort_values("기준 대비 온도차(℃)")
+        if not coefficient_data.empty:
+            category_order = coefficient_data["우세용도"].tolist()
+            base = alt.Chart(coefficient_data).encode(
+                y=alt.Y("우세용도:N", title=None, sort=category_order),
+            )
+            confidence_chart = base.mark_rule(strokeWidth=3).encode(
+                x=alt.X("95% 하한(℃):Q", title="기준 우세용도 대비 온도차 (℃)"),
+                x2="95% 상한(℃):Q",
+            )
+            point_chart = base.mark_point(filled=True, size=110).encode(
+                x=alt.X("기준 대비 온도차(℃):Q", title="기준 우세용도 대비 온도차 (℃)"),
+                color=alt.condition(
+                    alt.datum["기준 대비 온도차(℃)"] >= 0,
+                    alt.value("#d95f02"),
+                    alt.value("#1b9e77"),
+                ),
+                tooltip=[
+                    alt.Tooltip("우세용도:N"),
+                    alt.Tooltip("센서수:Q"),
+                    alt.Tooltip("평균온도(℃):Q", format=".2f"),
+                    alt.Tooltip("기준 대비 온도차(℃):Q", format="+.3f"),
+                    alt.Tooltip("95% 하한(℃):Q", format="+.3f"),
+                    alt.Tooltip("95% 상한(℃):Q", format="+.3f"),
+                    alt.Tooltip("p값:Q", format=".4f"),
+                ],
+            )
+            zero_line = (
+                alt.Chart(pd.DataFrame({"기준선": [0.0]}))
+                .mark_rule(color="#7d8682", strokeDash=[4, 4])
+                .encode(x="기준선:Q")
+            )
+            st.altair_chart(
+                (zero_line + confidence_chart + point_chart).properties(
+                    height=max(180, len(coefficient_data) * 46)
+                ),
+                width="stretch",
+            )
+
+        st.dataframe(
+            regression_table,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "평균온도(℃)": st.column_config.NumberColumn(format="%.2f ℃"),
+                "기준 대비 온도차(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
+                "표준오차": st.column_config.NumberColumn(format="%.3f"),
+                "95% 하한(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
+                "95% 상한(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
+                "p값": st.column_config.NumberColumn(format="%.4f"),
+            },
+        )
+        excluded = regression_info["excluded"]
+        excluded_text = (
+            ", ".join(f"{name}({count}개)" for name, count in excluded.items())
+            if excluded
+            else "없음"
+        )
+        st.caption(
+            f"종속변수는 현재 선택 시각의 센서 온도이며, 기준집단은 "
+            f"'{regression_info['reference']}'입니다. 계수와 95% 신뢰구간은 HC3 강건 표준오차를 사용했습니다. "
+            f"표본이 {regression_info['min_group_size']}개 미만이라 제외된 우세용도: {excluded_text}. "
+            "p<0.05는 기준집단과의 통계적 차이를 뜻하지만 인과효과를 의미하지 않습니다."
+        )
+else:
+    st.info("S-DoT 온도센서 토글을 켜면 우세용도별 OLS 회귀분석이 표시됩니다.")

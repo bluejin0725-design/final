@@ -4,3 +4,4 @@ streamlit-folium>=0.22,<1
 pandas>=2.2,<4
 pyarrow>=15,<25
 pillow>=10,<13
+statsmodels>=0.14.6,<1
