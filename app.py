@@ -480,95 +480,98 @@ def build_trend_table(sensor_table: pd.DataFrame, composition_columns: list[str]
     return trend
 
 
-def build_dominant_use_regression(
+def build_urban_share_regression(
     sensor_table: pd.DataFrame,
-    min_group_size: int = 3,
-) -> tuple[pd.DataFrame | None, dict[str, object]]:
-    """우세용도 범주별 온도 차이를 기준집단 대비 OLS 계수로 추정합니다."""
-    valid = sensor_table[["우세 용도", "온도(℃)"]].dropna().copy()
-    valid["우세 용도"] = valid["우세 용도"].astype(str)
-    valid["온도(℃)"] = pd.to_numeric(valid["온도(℃)"], errors="coerce")
-    valid = valid.dropna(subset=["온도(℃)"])
-
-    group_counts = valid["우세 용도"].value_counts()
-    eligible_counts = group_counts[group_counts >= min_group_size]
-    excluded = group_counts[group_counts < min_group_size].to_dict()
-    if len(eligible_counts) < 2:
-        return None, {
-            "reason": f"센서가 {min_group_size}개 이상인 우세용도가 2개 이상 필요합니다.",
-            "excluded": excluded,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None, dict[str, object]]:
+    """시가화건조지역 구성비와 온도의 선형관계를 OLS로 추정합니다."""
+    share_column = "시가화건조지역(%)"
+    required_columns = ["센서", "자치구", share_column, "온도(℃)"]
+    missing_columns = [column for column in required_columns if column not in sensor_table.columns]
+    if missing_columns:
+        return None, None, None, {
+            "reason": f"회귀분석에 필요한 열이 없습니다: {', '.join(missing_columns)}"
         }
 
-    reference = str(eligible_counts.index[0])
-    categories = [reference, *sorted(str(item) for item in eligible_counts.index[1:])]
-    analysis = valid[valid["우세 용도"].isin(categories)].copy()
+    analysis = sensor_table[required_columns].copy()
+    analysis[share_column] = pd.to_numeric(analysis[share_column], errors="coerce")
+    analysis["온도(℃)"] = pd.to_numeric(analysis["온도(℃)"], errors="coerce")
+    analysis = analysis.dropna(subset=[share_column, "온도(℃)"])
+    analysis = analysis[analysis[share_column].between(0, 100)].copy()
+    analysis = analysis.rename(columns={share_column: "시가화건조지역 비율(%)"})
 
-    design = pd.DataFrame({"const": 1.0}, index=analysis.index)
-    parameter_names: dict[str, str] = {}
-    for index, category in enumerate(categories[1:], start=1):
-        parameter = f"dominant_use_{index}"
-        parameter_names[category] = parameter
-        design[parameter] = (analysis["우세 용도"] == category).astype(float)
+    if len(analysis) < 5:
+        return None, None, None, {"reason": "유효한 센서가 5개 이상 필요합니다."}
+    if analysis["시가화건조지역 비율(%)"].nunique() < 2:
+        return None, None, None, {"reason": "시가화건조지역 비율에 변화가 없어 회귀계수를 계산할 수 없습니다."}
 
+    design = pd.DataFrame(
+        {
+            "const": 1.0,
+            "urban_share_pct": analysis["시가화건조지역 비율(%)"].astype(float),
+        },
+        index=analysis.index,
+    )
     model = sm.OLS(analysis["온도(℃)"].astype(float), design).fit(
         cov_type="HC3",
         use_t=True,
     )
     confidence = model.conf_int(alpha=0.05)
-    rows = []
-    for category in categories:
-        group = analysis[analysis["우세 용도"] == category]["온도(℃)"]
-        if category == reference:
-            coefficient = 0.0
-            standard_error = float("nan")
-            lower = float("nan")
-            upper = float("nan")
-            p_value = float("nan")
-            result = "기준집단"
-        else:
-            parameter = parameter_names[category]
-            coefficient = float(model.params[parameter])
-            standard_error = float(model.bse[parameter])
-            lower = float(confidence.loc[parameter, 0])
-            upper = float(confidence.loc[parameter, 1])
-            p_value = float(model.pvalues[parameter])
-            if p_value < 0.05:
-                result = "기준보다 유의하게 높음" if coefficient > 0 else "기준보다 유의하게 낮음"
-            else:
-                result = "유의한 차이 없음"
-        rows.append(
-            {
-                "우세용도": category,
-                "센서수": int(len(group)),
-                "평균온도(℃)": float(group.mean()),
-                "기준 대비 온도차(℃)": coefficient,
-                "표준오차": standard_error,
-                "95% 하한(℃)": lower,
-                "95% 상한(℃)": upper,
-                "p값": p_value,
-                "판정": result,
-            }
-        )
+    coefficient_1pct = float(model.params["urban_share_pct"])
+    standard_error_1pct = float(model.bse["urban_share_pct"])
+    lower_1pct = float(confidence.loc["urban_share_pct", 0])
+    upper_1pct = float(confidence.loc["urban_share_pct", 1])
+    p_value = float(model.pvalues["urban_share_pct"])
 
-    result_table = pd.DataFrame(rows)
-    numeric_columns = [
-        "평균온도(℃)",
-        "기준 대비 온도차(℃)",
-        "표준오차",
-        "95% 하한(℃)",
-        "95% 상한(℃)",
-        "p값",
+    if p_value < 0.05 and coefficient_1pct > 0:
+        judgement = "시가화 비중 증가와 유의한 온도 상승 관련"
+    elif p_value < 0.05:
+        judgement = "시가화 비중 증가와 유의한 온도 하락 관련"
+    else:
+        judgement = "통계적으로 유의한 선형관계 없음"
+
+    coefficient_table = pd.DataFrame(
+        [
+            {
+                "독립변수": "시가화건조지역 비율 10%p 증가",
+                "온도 변화(℃)": coefficient_1pct * 10,
+                "표준오차": standard_error_1pct * 10,
+                "95% 하한(℃)": lower_1pct * 10,
+                "95% 상한(℃)": upper_1pct * 10,
+                "p값": p_value,
+                "판정": judgement,
+            }
+        ]
+    )
+    numeric_columns = ["온도 변화(℃)", "표준오차", "95% 하한(℃)", "95% 상한(℃)", "p값"]
+    coefficient_table[numeric_columns] = coefficient_table[numeric_columns].round(4)
+
+    share_min = float(analysis["시가화건조지역 비율(%)"].min())
+    share_max = float(analysis["시가화건조지역 비율(%)"].max())
+    grid_count = 101
+    share_grid = [
+        share_min + (share_max - share_min) * index / (grid_count - 1)
+        for index in range(grid_count)
     ]
-    result_table[numeric_columns] = result_table[numeric_columns].round(4)
-    overall_p = float(model.f_pvalue) if pd.notna(model.f_pvalue) else float("nan")
-    return result_table, {
-        "reference": reference,
+    prediction_design = pd.DataFrame({"const": 1.0, "urban_share_pct": share_grid})
+    prediction = model.get_prediction(prediction_design).summary_frame(alpha=0.05)
+    prediction_curve = pd.DataFrame(
+        {
+            "시가화건조지역 비율(%)": share_grid,
+            "예측온도(℃)": prediction["mean"].to_numpy(),
+            "95% 하한(℃)": prediction["mean_ci_lower"].to_numpy(),
+            "95% 상한(℃)": prediction["mean_ci_upper"].to_numpy(),
+        }
+    )
+
+    return analysis, prediction_curve, coefficient_table, {
         "nobs": int(model.nobs),
         "r_squared": float(model.rsquared),
         "adjusted_r_squared": float(model.rsquared_adj),
-        "overall_p": overall_p,
-        "excluded": excluded,
-        "min_group_size": min_group_size,
+        "coefficient_10pct": coefficient_1pct * 10,
+        "p_value": p_value,
+        "share_min": share_min,
+        "share_max": share_max,
+        "judgement": judgement,
     }
 
 
@@ -910,86 +913,102 @@ with st.expander("데이터 및 분석 기준"):
 st.caption("자료 출처: 사용자 제공 2024 토지피복 SHP · 서울특별시 서울열린데이터광장")
 
 st.divider()
-st.subheader("우세용도에 따른 온도 차이 OLS 회귀분석")
+st.subheader("시가화건조지역 비중과 온도 OLS 회귀분석")
 if show_temperature_sensors and sensor_table is not None and not sensor_table.empty:
-    regression_table, regression_info = build_dominant_use_regression(sensor_table)
-    if regression_table is None:
+    regression_data, prediction_curve, regression_table, regression_info = (
+        build_urban_share_regression(sensor_table)
+    )
+    if regression_data is None or prediction_curve is None or regression_table is None:
         st.warning(str(regression_info["reason"]))
     else:
         metric1, metric2, metric3, metric4 = st.columns(4)
         metric1.metric("분석 센서", f"{int(regression_info['nobs']):,}개")
-        metric2.metric("기준 우세용도", str(regression_info["reference"]))
+        coefficient_10pct = float(regression_info["coefficient_10pct"])
+        metric2.metric("시가화 비율 10%p 증가", f"{coefficient_10pct:+.3f} ℃")
         metric3.metric("설명력 R²", f"{float(regression_info['r_squared']):.3f}")
-        overall_p = float(regression_info["overall_p"])
-        metric4.metric("모형 전체 p값", f"{overall_p:.4f}" if pd.notna(overall_p) else "계산 불가")
+        p_value = float(regression_info["p_value"])
+        metric4.metric("계수 p값", "<0.0001" if p_value < 0.0001 else f"{p_value:.4f}")
 
-        coefficient_data = regression_table[
-            (regression_table["판정"] != "기준집단")
-            & regression_table["기준 대비 온도차(℃)"].notna()
-        ].copy()
-        coefficient_data = coefficient_data.sort_values("기준 대비 온도차(℃)")
-        if not coefficient_data.empty:
-            category_order = coefficient_data["우세용도"].tolist()
-            base = alt.Chart(coefficient_data).encode(
-                y=alt.Y("우세용도:N", title=None, sort=category_order),
+        effect_lower = float(regression_table.iloc[0]["95% 하한(℃)"])
+        effect_upper = float(regression_table.iloc[0]["95% 상한(℃)"])
+        p_text = "p<0.0001" if p_value < 0.0001 else f"p={p_value:.4f}"
+        if p_value < 0.05 and coefficient_10pct > 0:
+            st.success(
+                f"현재 선택 조건에서는 시가화건조지역 비율이 10%p 증가할 때 온도가 평균 "
+                f"{coefficient_10pct:.3f}℃ 높아지는 통계적으로 유의한 양(+)의 관계가 나타났습니다 "
+                f"(95% 신뢰구간 {effect_lower:.3f}~{effect_upper:.3f}℃, {p_text})."
             )
-            confidence_chart = base.mark_rule(strokeWidth=3).encode(
-                x=alt.X("95% 하한(℃):Q", title="기준 우세용도 대비 온도차 (℃)"),
-                x2="95% 상한(℃):Q",
+        elif p_value < 0.05:
+            st.warning(
+                f"현재 선택 조건에서는 시가화건조지역 비율이 10%p 증가할 때 온도가 평균 "
+                f"{abs(coefficient_10pct):.3f}℃ 낮아지는 통계적으로 유의한 음(-)의 관계가 나타났습니다 "
+                f"(95% 신뢰구간 {effect_lower:.3f}~{effect_upper:.3f}℃, {p_text})."
             )
-            point_chart = base.mark_point(filled=True, size=110).encode(
-                x=alt.X("기준 대비 온도차(℃):Q", title="기준 우세용도 대비 온도차 (℃)"),
-                color=alt.condition(
-                    alt.datum["기준 대비 온도차(℃)"] >= 0,
-                    alt.value("#d95f02"),
-                    alt.value("#1b9e77"),
-                ),
-                tooltip=[
-                    alt.Tooltip("우세용도:N"),
-                    alt.Tooltip("센서수:Q"),
-                    alt.Tooltip("평균온도(℃):Q", format=".2f"),
-                    alt.Tooltip("기준 대비 온도차(℃):Q", format="+.3f"),
-                    alt.Tooltip("95% 하한(℃):Q", format="+.3f"),
-                    alt.Tooltip("95% 상한(℃):Q", format="+.3f"),
-                    alt.Tooltip("p값:Q", format=".4f"),
-                ],
+        else:
+            st.info(
+                f"현재 선택 조건에서는 시가화건조지역 비율과 온도의 선형관계가 통계적으로 "
+                f"유의하지 않았습니다 (10%p당 {coefficient_10pct:+.3f}℃, {p_text})."
             )
-            zero_line = (
-                alt.Chart(pd.DataFrame({"기준선": [0.0]}))
-                .mark_rule(color="#7d8682", strokeDash=[4, 4])
-                .encode(x="기준선:Q")
-            )
-            st.altair_chart(
-                (zero_line + confidence_chart + point_chart).properties(
-                    height=max(180, len(coefficient_data) * 46)
-                ),
-                width="stretch",
-            )
+
+        scatter = alt.Chart(regression_data).mark_circle(size=64, opacity=0.58).encode(
+            x=alt.X(
+                "시가화건조지역 비율(%):Q",
+                title="300m 버퍼 내 시가화건조지역 비율 (%)",
+                scale=alt.Scale(zero=False),
+            ),
+            y=alt.Y("온도(℃):Q", title="S-DoT 온도 (℃)", scale=alt.Scale(zero=False)),
+            color=alt.value("#4d8073"),
+            tooltip=[
+                alt.Tooltip("센서:N"),
+                alt.Tooltip("자치구:N"),
+                alt.Tooltip("시가화건조지역 비율(%):Q", format=".2f"),
+                alt.Tooltip("온도(℃):Q", format=".2f"),
+            ],
+        )
+        confidence_band = alt.Chart(prediction_curve).mark_area(
+            color="#d95f02",
+            opacity=0.16,
+        ).encode(
+            x=alt.X("시가화건조지역 비율(%):Q"),
+            y=alt.Y("95% 하한(℃):Q"),
+            y2="95% 상한(℃):Q",
+        )
+        regression_line = alt.Chart(prediction_curve).mark_line(
+            color="#d95f02",
+            strokeWidth=3,
+        ).encode(
+            x=alt.X("시가화건조지역 비율(%):Q"),
+            y=alt.Y("예측온도(℃):Q"),
+            tooltip=[
+                alt.Tooltip("시가화건조지역 비율(%):Q", format=".1f"),
+                alt.Tooltip("예측온도(℃):Q", format=".2f"),
+                alt.Tooltip("95% 하한(℃):Q", format=".2f"),
+                alt.Tooltip("95% 상한(℃):Q", format=".2f"),
+            ],
+        )
+        st.altair_chart(
+            (confidence_band + regression_line + scatter).properties(height=420),
+            width="stretch",
+        )
 
         st.dataframe(
             regression_table,
             hide_index=True,
             width="stretch",
             column_config={
-                "평균온도(℃)": st.column_config.NumberColumn(format="%.2f ℃"),
-                "기준 대비 온도차(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
+                "온도 변화(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
                 "표준오차": st.column_config.NumberColumn(format="%.3f"),
                 "95% 하한(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
                 "95% 상한(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
                 "p값": st.column_config.NumberColumn(format="%.4f"),
             },
         )
-        excluded = regression_info["excluded"]
-        excluded_text = (
-            ", ".join(f"{name}({count}개)" for name, count in excluded.items())
-            if excluded
-            else "없음"
-        )
         st.caption(
-            f"종속변수는 현재 선택 시각의 센서 온도이며, 기준집단은 "
-            f"'{regression_info['reference']}'입니다. 계수와 95% 신뢰구간은 HC3 강건 표준오차를 사용했습니다. "
-            f"표본이 {regression_info['min_group_size']}개 미만이라 제외된 우세용도: {excluded_text}. "
-            "p<0.05는 기준집단과의 통계적 차이를 뜻하지만 인과효과를 의미하지 않습니다."
+            f"종속변수는 현재 선택 시각의 센서 온도, 독립변수는 300m 버퍼 내 시가화건조지역 비율입니다. "
+            f"분석된 비율 범위는 {float(regression_info['share_min']):.1f}%~"
+            f"{float(regression_info['share_max']):.1f}%이며, 계수와 평균 예측값의 95% 신뢰구간은 "
+            "HC3 강건 표준오차를 사용했습니다. p<0.05는 통계적 연관성을 뜻하지만 "
+            "다른 환경요인을 통제한 인과효과를 의미하지 않습니다."
         )
 else:
-    st.info("S-DoT 온도센서 토글을 켜면 우세용도별 OLS 회귀분석이 표시됩니다.")
+    st.info("S-DoT 온도센서 토글을 켜면 시가화 비중과 온도의 OLS 회귀분석이 표시됩니다.")
