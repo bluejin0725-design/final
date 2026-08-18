@@ -4,6 +4,7 @@ from html import escape
 import gzip
 import json
 from pathlib import Path
+from urllib.parse import quote
 
 import altair as alt
 import folium
@@ -83,6 +84,35 @@ def class_color(class_code: str) -> str:
     except ValueError:
         detail_offset = sum(ord(character) for character in code) % 40
     return f"hsl({(base_hue + detail_offset) % 360:.0f}, 68%, 46%)"
+
+
+def pie_chart_data_url(
+    row: pd.Series,
+    composition_columns: list[str],
+    colors: dict[str, str],
+) -> str:
+    """센서별 토지피복 구성비를 표 안에서 표시할 SVG 파이차트로 변환합니다."""
+    segments = []
+    accumulated = 0.0
+    for column in composition_columns:
+        raw_share = pd.to_numeric(row.get(column, 0), errors="coerce")
+        share = 0.0 if pd.isna(raw_share) else float(raw_share)
+        if share <= 0:
+            continue
+        segments.append(
+            '<circle cx="36" cy="36" r="18" fill="none" '
+            f'stroke="{colors[column]}" stroke-width="36" pathLength="100" '
+            f'stroke-dasharray="{share:.4f} {100 - share:.4f}" '
+            f'stroke-dashoffset="{-accumulated:.4f}" transform="rotate(-90 36 36)"/>'
+        )
+        accumulated += share
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72">'
+        '<circle cx="36" cy="36" r="36" fill="#e5e7eb"/>'
+        + "".join(segments)
+        + '</svg>'
+    )
+    return "data:image/svg+xml;utf8," + quote(svg, safe="")
 
 
 def clean_temperature(data: pd.DataFrame) -> pd.DataFrame:
@@ -352,6 +382,10 @@ def build_sensor_table(
     )
     composition.columns = [f"{column}(%)" for column in composition.columns]
     composition_columns = list(composition.columns)
+    class_colors = {
+        f"{row.class_name}(%)": class_color(str(row.class_code))
+        for row in large_class.drop_duplicates("class_name").itertuples(index=False)
+    }
 
     dominant_indexes = large_class.groupby("serial")["share_pct"].idxmax()
     dominant = large_class.loc[
@@ -386,6 +420,17 @@ def build_sensor_table(
     )
     numeric_columns = ["온도(℃)", "SHP 피복률(%)", "우세 비율(%)", *composition_columns]
     table[numeric_columns] = table[numeric_columns].round(2)
+    pie_column_position = table.columns.get_loc("온도(℃)") + 1
+    table.insert(
+        pie_column_position,
+        "피복 구성비",
+        table.apply(
+            pie_chart_data_url,
+            axis=1,
+            composition_columns=composition_columns,
+            colors=class_colors,
+        ),
+    )
     return table, composition_columns
 
 
@@ -655,7 +700,14 @@ if show_temperature_sensors and buffer_stats is not None and sdot_snapshot is no
         hide_index=True,
         width="stretch",
         height=430,
+        row_height=64,
         column_config={
+            "피복 구성비": st.column_config.ImageColumn(
+                "피복 구성비",
+                width="small",
+                help="각 센서 300m 버퍼의 대분류 구성비입니다. 두 번 클릭하면 확대됩니다.",
+                pinned=True,
+            ),
             "온도(℃)": st.column_config.NumberColumn(format="%.2f ℃"),
             "SHP 피복률(%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
             "우세 비율(%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
@@ -667,7 +719,9 @@ if show_temperature_sensors and buffer_stats is not None and sdot_snapshot is no
     )
     st.download_button(
         "정렬된 센서표 CSV 다운로드",
-        sorted_sensor_table.to_csv(index=False).encode("utf-8-sig"),
+        sorted_sensor_table.drop(columns=["피복 구성비"])
+        .to_csv(index=False)
+        .encode("utf-8-sig"),
         file_name="sdot_300m_landcover_temperature.csv",
         mime="text/csv",
     )
