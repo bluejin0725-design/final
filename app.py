@@ -68,12 +68,12 @@ ANALYSIS_COVER_COLORS = {
 }
 
 # 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
-# 왼쪽으로 갈수록 낮은 피복비율의 초록색 성분이 강해지고,
-# 위쪽으로 갈수록 높은 온도의 빨간색 성분이 강해지는 이변량 팔레트입니다.
+# 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
+# 온도가 높을수록 붉어지고, 피복비율이 높을수록 같은 빨강이 어두워집니다.
 BIVARIATE_COLORS = [
-    ["#e8f5e9", "#f7e6b5", "#f4c95d"],
-    ["#a8c686", "#d99b68", "#d66a4b"],
-    ["#7b7d55", "#ad4b3f", "#7f0000"],
+    ["#fff5f0", "#b8b0ad", "#736e6c"],
+    ["#fb6a4a", "#b54c35", "#713021"],
+    ["#cb181d", "#921115", "#5b0b0d"],
 ]
 BIVARIATE_REFERENCE = (
     "https://pro.arcgis.com/en/pro-app/3.6/help/mapping/"
@@ -618,8 +618,8 @@ def add_bivariate_buffer_layer(
       </div>
       <div style="margin:4px 0 0 39px;text-align:center">{escape(cover_name)} 비율 →</div>
       <div style="margin-top:6px;color:#59635f;border-top:1px solid #d7dfdc;padding-top:5px">
-        왼쪽·초록색일수록 {escape(cover_name)} 비율 낮음<br>
-        위쪽·빨간색일수록 온도 높음 · 오른쪽 위가 가장 진함<br>
+        붉을수록 온도 높음 · 어두울수록 {escape(cover_name)} 비율 높음<br>
+        두 값이 모두 높으면 가장 진한 빨간색<br>
         버퍼 투명도 {normalized_transparency:.0%} · 중첩부 색상 혼합<br>
         각 변수 삼분위 · n={len(features)}<br>
         피복 경계 {cover_thresholds[0]:.1f}, {cover_thresholds[1]:.1f}% ·
