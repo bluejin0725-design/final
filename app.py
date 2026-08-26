@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import base64
 from html import escape
 import gzip
+from io import BytesIO
 import json
 from pathlib import Path
 from urllib.parse import quote
 
 import altair as alt
 import folium
+import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import streamlit as st
 from branca.colormap import LinearColormap
 from folium.plugins import Fullscreen, LocateControl
 from folium.utilities import JsCode
+from PIL import Image
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from streamlit_folium import st_folium
 
@@ -47,7 +51,7 @@ BUFFER_STATS_FILE_NAME = "sdot_buffer300m_landcover.parquet"
 TEMPERATURE_COLUMN = "temperature_c"
 TEMPERATURE_MIN = -30.0
 TEMPERATURE_MAX = 50.0
-TEMPERATURE_COLORS = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
+TEMPERATURE_COLORS = ["#fff5f0", "#fcbba1", "#fb6a4a", "#de2d26", "#7f0000"]
 
 # 사용자가 분석 제외를 요청한 대분류와 그 하위 분류 코드입니다.
 # 2=농업지역, 5=습지, 6=나지이며 지도 원본 오버레이에는 남겨 두되
@@ -67,12 +71,12 @@ ANALYSIS_COVER_COLORS = {
     "수역(%)": "#3182bd",
 }
 
-# ArcGIS의 3×3 이변량 색상 지도 원리를 적용한 팔레트입니다.
 # 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
+# 위쪽으로 갈수록 붉어지고, 오른쪽으로 갈수록 명도를 낮춰 어둡게 보입니다.
 BIVARIATE_COLORS = [
-    ["#e8e8e8", "#ace4e4", "#5ac8c8"],
-    ["#dfb0d6", "#a5add3", "#5698b9"],
-    ["#be64ac", "#8c62aa", "#3b4994"],
+    ["#fff5f0", "#b8b0ad", "#736e6c"],
+    ["#fb6a4a", "#b54c35", "#713021"],
+    ["#cb181d", "#921115", "#5b0b0d"],
 ]
 BIVARIATE_REFERENCE = (
     "https://pro.arcgis.com/en/pro-app/3.6/help/mapping/"
@@ -408,6 +412,159 @@ def add_buffer_layer(
     return len(features)
 
 
+
+@st.cache_data(show_spinner=False)
+def build_interpolated_surface(
+    stats: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    min_coverage: float,
+    allowed_serials: tuple[str, ...],
+    cover_name: str,
+) -> tuple[str | None, list[list[float]] | None, int]:
+    """인근 센서의 온도와 피복비율을 거리역수 가중법으로 연속 보간합니다."""
+    composition = build_analysis_composition(stats, min_coverage)
+    if composition.empty or cover_name not in composition.columns:
+        return None, None, 0
+
+    point_columns = [
+        "serial",
+        "latitude",
+        "longitude",
+        TEMPERATURE_COLUMN,
+    ]
+    points = snapshot[point_columns].copy()
+    points["serial"] = points["serial"].astype(str)
+    for column in ["latitude", "longitude", TEMPERATURE_COLUMN]:
+        points[column] = pd.to_numeric(points[column], errors="coerce")
+    points = (
+        points.dropna(subset=["latitude", "longitude", TEMPERATURE_COLUMN])
+        .drop_duplicates("serial", keep="last")
+        .set_index("serial")
+    )
+
+    analysis = composition[[cover_name]].join(points, how="inner")
+    analysis = analysis.loc[
+        analysis.index.astype(str).isin(allowed_serials)
+    ].copy()
+    if len(analysis) < 3:
+        return None, None, len(analysis)
+
+    latitudes = analysis["latitude"].to_numpy(dtype=np.float32)
+    longitudes = analysis["longitude"].to_numpy(dtype=np.float32)
+    temperatures = analysis[TEMPERATURE_COLUMN].to_numpy(dtype=np.float32)
+    cover_shares = analysis[cover_name].to_numpy(dtype=np.float32)
+
+    latitude_span = max(float(latitudes.max() - latitudes.min()), 0.01)
+    longitude_span = max(float(longitudes.max() - longitudes.min()), 0.01)
+    latitude_padding = max(0.015, latitude_span * 0.08)
+    longitude_padding = max(0.018, longitude_span * 0.08)
+    latitude_min = float(latitudes.min()) - latitude_padding
+    latitude_max = float(latitudes.max()) + latitude_padding
+    longitude_min = float(longitudes.min()) - longitude_padding
+    longitude_max = float(longitudes.max()) + longitude_padding
+
+    mean_latitude_radians = np.deg2rad(float(latitudes.mean()))
+    longitude_scale = max(float(np.cos(mean_latitude_radians)), 0.5)
+    grid_width = 260
+    projected_width = (longitude_max - longitude_min) * longitude_scale
+    projected_height = latitude_max - latitude_min
+    grid_height = int(
+        np.clip(grid_width * projected_height / max(projected_width, 0.001), 150, 320)
+    )
+
+    grid_longitudes, grid_latitudes = np.meshgrid(
+        np.linspace(longitude_min, longitude_max, grid_width, dtype=np.float32),
+        np.linspace(latitude_max, latitude_min, grid_height, dtype=np.float32),
+    )
+    delta_longitude = (
+        grid_longitudes[..., None] - longitudes[None, None, :]
+    ) * longitude_scale
+    delta_latitude = grid_latitudes[..., None] - latitudes[None, None, :]
+    distance_squared = delta_longitude**2 + delta_latitude**2
+
+    # 약 130m의 완충값을 두어 센서 바로 위에서 한 점의 색이 과도하게 튀지 않게 합니다.
+    weights = 1.0 / np.power(distance_squared + np.float32(0.0012**2), 1.25)
+    weight_sum = weights.sum(axis=2)
+    interpolated_temperature = (
+        weights * temperatures[None, None, :]
+    ).sum(axis=2) / weight_sum
+    interpolated_cover = (
+        weights * cover_shares[None, None, :]
+    ).sum(axis=2) / weight_sum
+
+    def robust_normalize(
+        grid_values: np.ndarray,
+        source_values: np.ndarray,
+    ) -> np.ndarray:
+        lower, upper = np.quantile(source_values, [0.05, 0.95])
+        if float(upper - lower) <= 1e-9:
+            return np.full_like(grid_values, 0.5, dtype=np.float32)
+        return np.clip((grid_values - lower) / (upper - lower), 0.0, 1.0)
+
+    temperature_level = robust_normalize(
+        interpolated_temperature,
+        temperatures,
+    )
+    cover_level = robust_normalize(interpolated_cover, cover_shares)
+
+    # 온도는 연한 홍색→붉은색, 피복비율은 밝음→어두움으로 독립적으로 표현합니다.
+    cool_rgb = np.array([255.0, 245.0, 240.0], dtype=np.float32)
+    hot_rgb = np.array([203.0, 24.0, 29.0], dtype=np.float32)
+    rgb = cool_rgb + temperature_level[..., None] * (hot_rgb - cool_rgb)
+    darkness = 1.0 - 0.55 * cover_level
+    rgb = np.clip(rgb * darkness[..., None], 0, 255).astype(np.uint8)
+
+    nearest_distance_km = np.sqrt(distance_squared.min(axis=2)) * 111.32
+    alpha = 145.0 * np.exp(-0.5 * (nearest_distance_km / 1.6) ** 2)
+    alpha[nearest_distance_km > 4.5] = 0
+    rgba = np.dstack([rgb, np.clip(alpha, 0, 145).astype(np.uint8)])
+
+    image_buffer = BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(
+        image_buffer,
+        format="PNG",
+        optimize=True,
+    )
+    image_url = "data:image/png;base64," + base64.b64encode(
+        image_buffer.getvalue()
+    ).decode("ascii")
+    bounds = [
+        [latitude_min, longitude_min],
+        [latitude_max, longitude_max],
+    ]
+    return image_url, bounds, len(analysis)
+
+
+def add_interpolated_surface(
+    parent_group: folium.FeatureGroup,
+    stats: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    min_coverage: float,
+    allowed_serials: set[str],
+    cover_name: str,
+) -> int:
+    """버퍼 밖에서도 인근 센서의 결합 색상이 부드럽게 이어지도록 표시합니다."""
+    image_url, bounds, point_count = build_interpolated_surface(
+        stats,
+        snapshot,
+        min_coverage,
+        tuple(sorted(allowed_serials)),
+        cover_name,
+    )
+    if image_url is None or bounds is None:
+        return 0
+
+    folium.raster_layers.ImageOverlay(
+        image=image_url,
+        bounds=bounds,
+        opacity=1.0,
+        interactive=False,
+        cross_origin=False,
+        zindex=1,
+        name=f"{cover_name}·온도 공간 그라데이션",
+    ).add_to(parent_group)
+    return point_count
+
 def add_bivariate_buffer_layer(
     parent_group: folium.FeatureGroup,
     map_object: folium.Map,
@@ -533,14 +690,14 @@ def add_bivariate_buffer_layer(
     legend_cells = []
     for temperature_class in (2, 1, 0):
         legend_cells.append(
-            f'<span style="font-size:10px;text-align:right;padding-right:3px">'
+            f'<span style="font-size:10px;text-align:right;padding-right:4px">'
             f'{tertile_label(temperature_class)}</span>'
         )
         for cover_class in (0, 1, 2):
             color = BIVARIATE_COLORS[temperature_class][cover_class]
             legend_cells.append(
-                f'<span style="width:27px;height:27px;background:{color};'
-                f'display:block;border:1px solid rgba(255,255,255,.65)"></span>'
+                f'<span style="width:29px;height:29px;background:{color};'
+                f'display:block;border:1px solid rgba(255,255,255,.7)"></span>'
             )
     legend_html = f"""
     <div style="position:fixed;right:14px;bottom:38px;z-index:9999;
@@ -548,16 +705,17 @@ def add_bivariate_buffer_layer(
                 border-radius:7px;border:1px solid #cdd6d2;font:11px/1.35 sans-serif;
                 box-shadow:0 1px 5px rgba(0,0,0,.18)">
       <b>{escape(cover_name)} 비율 × 온도</b>
-      <div style="margin-top:6px;display:grid;grid-template-columns:34px repeat(3,27px);
+      <div style="margin-top:6px;display:grid;grid-template-columns:38px repeat(3,29px);
                   gap:1px;align-items:center">
+        <span style="text-align:right;padding-right:4px;font-weight:700">온도 ↑</span>
+        <span></span><span></span><span></span>
         {''.join(legend_cells)}
         <span></span><span style="text-align:center">낮음</span>
         <span style="text-align:center">중간</span><span style="text-align:center">높음</span>
       </div>
-      <div style="margin:4px 0 0 35px;text-align:center">{escape(cover_name)} 비율 →</div>
-      <div style="position:absolute;left:3px;top:56px;writing-mode:vertical-rl;
-                  transform:rotate(180deg)">온도 →</div>
+      <div style="margin:4px 0 0 39px;text-align:center">{escape(cover_name)} 비율 →</div>
       <div style="margin-top:6px;color:#59635f;border-top:1px solid #d7dfdc;padding-top:5px">
+        붉을수록 고온 · 어두울수록 피복비율 높음<br>
         각 변수 삼분위 · n={len(features)}<br>
         피복 경계 {cover_thresholds[0]:.1f}, {cover_thresholds[1]:.1f}% ·
         온도 경계 {temperature_thresholds[0]:.1f}, {temperature_thresholds[1]:.1f}℃
@@ -908,6 +1066,7 @@ buffer_level = "대분류"
 min_buffer_coverage = 50.0
 selected_district = "전체"
 analysis_cover_name = "시가화건조지역"
+show_interpolated_surface = True
 
 with st.sidebar:
     st.header("지도 설정")
@@ -962,6 +1121,14 @@ with st.sidebar:
             list(ANALYSIS_COVER_COMPONENTS),
             help="녹지는 산림지역과 초지의 합입니다.",
         )
+        show_interpolated_surface = st.toggle(
+            "버퍼 밖 공간 그라데이션",
+            value=True,
+            help=(
+                "인근 센서의 현재 온도와 선택한 피복비율을 거리역수 가중법으로 "
+                "보간합니다. 실제 관측 경계가 아닌 탐색용 추정면입니다."
+            ),
+        )
         buffer_level = st.selectbox(
             "센서 상세보기 분류",
             ["대분류", "중분류", "세분류"],
@@ -1006,7 +1173,10 @@ with st.sidebar:
         if selected_option != "선택 안 함":
             selected_buffer_serial = selected_option
 
-    st.caption("기본 지도는 선택 피복비율과 온도를 한 색으로 결합한 3×3 이변량 지도입니다.")
+    st.caption(
+        "기본 지도는 고온일수록 붉고 선택 피복비율이 높을수록 어두운 "
+        "3×3 이변량 지도입니다."
+    )
 
 if show_temperature_sensors and sdot_snapshot is not None:
     valid_temperatures = sdot_snapshot[TEMPERATURE_COLUMN].dropna()
@@ -1029,9 +1199,14 @@ if selected_buffer_serial and buffer_geojson is not None:
     zoom = 16
 
 st.subheader(f"{analysis_cover_name} 비율과 온도의 공간적 관계")
+surface_caption = (
+    " 버퍼 밖은 인근 센서값을 거리역수 가중법으로 보간한 반투명 추정면입니다."
+    if show_interpolated_surface
+    else ""
+)
 st.caption(
-    "버퍼 색상 하나에 피복비율과 온도의 낮음·중간·높음 조합을 표시합니다. "
-    "오른쪽 아래 3×3 범례에서 두 변수가 동시에 높은 영역을 바로 확인할 수 있습니다."
+    f"붉을수록 온도가 높고, 어두울수록 {analysis_cover_name} 비율이 높습니다."
+    + surface_caption
 )
 map_object = build_base_map(center, zoom, selected_basemap)
 
@@ -1051,6 +1226,23 @@ if (
     and buffer_stats is not None
 ):
     allowed_serials = set(sdot_snapshot["serial"].astype(str))
+    if show_interpolated_surface:
+        surface_group = folium.FeatureGroup(
+            name=f"{analysis_cover_name}·온도 공간 그라데이션",
+            show=True,
+            control=True,
+        )
+        interpolated_point_count = add_interpolated_surface(
+            surface_group,
+            buffer_stats,
+            sdot_snapshot,
+            min_buffer_coverage,
+            allowed_serials,
+            analysis_cover_name,
+        )
+        if interpolated_point_count > 0:
+            surface_group.add_to(map_object)
+
     relationship_group = folium.FeatureGroup(
         name=f"{analysis_cover_name} 비율 × 온도",
         show=True,
@@ -1090,6 +1282,7 @@ map_key_parts = [
     str(show_shp),
     str(shp_opacity),
     str(show_temperature_sensors),
+    str(show_interpolated_surface),
     analysis_cover_name,
     buffer_level,
     str(min_buffer_coverage),

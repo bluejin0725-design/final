@@ -1,5 +1,6 @@
 streamlit>=1.45,<2
 folium>=0.20,<1
+numpy>=1.26,<3
 streamlit-folium>=0.22,<1
 pandas>=2.2,<4
 pyarrow>=15,<25
