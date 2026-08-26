@@ -68,11 +68,11 @@ ANALYSIS_COVER_COLORS = {
 }
 
 # 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
-# 위쪽으로 갈수록 붉어지고, 오른쪽으로 갈수록 명도를 낮춰 어둡게 보입니다.
+# 위쪽으로 갈수록 붉어지고, 오른쪽으로 갈수록 노란색이 짙어집니다.
 BIVARIATE_COLORS = [
-    ["#fff5f0", "#b8b0ad", "#736e6c"],
-    ["#fb6a4a", "#b54c35", "#713021"],
-    ["#cb181d", "#921115", "#5b0b0d"],
+    ["#fff7ec", "#ffe08a", "#d8a600"],
+    ["#f9b49b", "#ed9f55", "#c88700"],
+    ["#b30000", "#c44516", "#a96500"],
 ]
 BIVARIATE_REFERENCE = (
     "https://pro.arcgis.com/en/pro-app/3.6/help/mapping/"
@@ -459,7 +459,7 @@ def add_bivariate_buffer_layer(
     allowed_serials: set[str],
     selected_serial: str | None,
     cover_name: str,
-    buffer_opacity: float,
+    buffer_transparency: float,
 ) -> int:
     """선택 피복비율과 온도의 3×3 이변량 관계 지도를 추가합니다."""
     composition = build_analysis_composition(stats, min_coverage)
@@ -531,7 +531,8 @@ def add_bivariate_buffer_layer(
         )
     )
 
-    normalized_opacity = max(0.20, min(0.90, float(buffer_opacity)))
+    normalized_transparency = max(0.10, min(0.80, float(buffer_transparency)))
+    normal_fill_opacity = 1.0 - normalized_transparency
 
     def style_function(feature: dict) -> dict:
         properties = feature["properties"]
@@ -540,9 +541,9 @@ def add_bivariate_buffer_layer(
             "fillColor": properties["bivariate_color"],
             "weight": 4 if properties["selected"] else 0,
             "fillOpacity": (
-                min(1.0, normalized_opacity + 0.15)
+                min(1.0, normal_fill_opacity + 0.15)
                 if properties["selected"]
-                else normalized_opacity
+                else normal_fill_opacity
             ),
             "dashArray": None,
         }
@@ -554,7 +555,7 @@ def add_bivariate_buffer_layer(
         highlight_function=lambda _: {
             "weight": 3,
             "color": "#111827",
-            "fillOpacity": min(1.0, normalized_opacity + 0.15),
+            "fillOpacity": min(1.0, normal_fill_opacity + 0.15),
         },
         smooth_factor=2.0,
         tooltip=folium.GeoJsonTooltip(
@@ -616,8 +617,8 @@ def add_bivariate_buffer_layer(
       </div>
       <div style="margin:4px 0 0 39px;text-align:center">{escape(cover_name)} 비율 →</div>
       <div style="margin-top:6px;color:#59635f;border-top:1px solid #d7dfdc;padding-top:5px">
-        붉을수록 고온 · 어두울수록 피복비율 높음<br>
-        버퍼 투명도 {normalized_opacity:.0%} · 중첩부 색상 혼합<br>
+        붉을수록 고온 · 노란색이 짙을수록 피복비율 높음<br>
+        버퍼 투명도 {normalized_transparency:.0%} · 중첩부 색상 혼합<br>
         각 변수 삼분위 · n={len(features)}<br>
         피복 경계 {cover_thresholds[0]:.1f}, {cover_thresholds[1]:.1f}% ·
         온도 경계 {temperature_thresholds[0]:.1f}, {temperature_thresholds[1]:.1f}℃
@@ -812,6 +813,66 @@ def build_trend_table(sensor_table: pd.DataFrame, composition_columns: list[str]
     return trend
 
 
+def build_urbanity_temperature_profile(
+    sensor_table: pd.DataFrame,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, str | None]:
+    """토지피복 기반 도심성 지수를 세 구간으로 나눠 평균 온도를 요약합니다."""
+    required_columns = ["시가화건조지역(%)", "녹지(%)", "온도(℃)"]
+    missing_columns = [
+        column for column in required_columns if column not in sensor_table.columns
+    ]
+    if missing_columns:
+        return None, None, "도심성 도표에 필요한 열이 없습니다: " + ", ".join(missing_columns)
+
+    valid = sensor_table[required_columns].copy()
+    valid[required_columns] = valid[required_columns].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    valid = valid.dropna(subset=required_columns)
+    if len(valid) < 9:
+        return None, None, "도심성 구간을 비교하려면 유효 센서가 9개 이상 필요합니다."
+
+    # 실제 산지까지의 거리 대신 '시가화건조 비율 - 녹지 비율'을 사용합니다.
+    # 값이 낮으면 녹지 우세(산지 인접형), 높으면 시가화 우세(도심부)로 해석합니다.
+    valid["도심성 지수"] = (
+        valid["시가화건조지역(%)"] - valid["녹지(%)"]
+    )
+    if valid["도심성 지수"].nunique() < 3:
+        return None, None, "도심성 지수 값의 종류가 부족해 세 구간으로 나눌 수 없습니다."
+
+    zone_order = ["산지 인접형", "전이지대", "도심부"]
+    valid["공간 유형"] = pd.qcut(
+        valid["도심성 지수"].rank(method="first"),
+        q=3,
+        labels=zone_order,
+    )
+
+    summary = (
+        valid.groupby("공간 유형", observed=True)
+        .agg(
+            센서수=("온도(℃)", "size"),
+            평균온도=("온도(℃)", "mean"),
+            온도표준편차=("온도(℃)", "std"),
+            평균시가화건조비율=("시가화건조지역(%)", "mean"),
+            평균녹지비율=("녹지(%)", "mean"),
+            평균도심성지수=("도심성 지수", "mean"),
+        )
+        .reset_index()
+    )
+    standard_error = (
+        summary["온도표준편차"].fillna(0)
+        / summary["센서수"].astype(float).pow(0.5)
+    )
+    summary["신뢰구간 하한"] = summary["평균온도"] - 1.96 * standard_error
+    summary["신뢰구간 상한"] = summary["평균온도"] + 1.96 * standard_error
+    summary["공간 유형"] = summary["공간 유형"].astype(str)
+    summary["표시순서"] = summary["공간 유형"].map(
+        {zone: index for index, zone in enumerate(zone_order)}
+    )
+    summary = summary.sort_values("표시순서").reset_index(drop=True)
+    return valid, summary, None
+
+
 def build_landcover_multiple_regression(
     sensor_table: pd.DataFrame,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None, dict[str, object]]:
@@ -968,7 +1029,7 @@ buffer_level = "대분류"
 min_buffer_coverage = 50.0
 selected_district = "전체"
 analysis_cover_name = "시가화건조지역"
-buffer_opacity = 0.65
+buffer_transparency = 0.55
 
 with st.sidebar:
     st.header("지도 설정")
@@ -1023,13 +1084,13 @@ with st.sidebar:
             list(ANALYSIS_COVER_COMPONENTS),
             help="녹지는 산림지역과 초지의 합입니다.",
         )
-        buffer_opacity = st.slider(
+        buffer_transparency = st.slider(
             "버퍼 투명도",
-            0.20,
-            0.90,
-            0.65,
+            0.10,
+            0.80,
+            0.55,
             0.05,
-            help="값이 낮을수록 배경지도가 더 보이고 중첩부의 색상 혼합이 강조됩니다.",
+            help="값이 높을수록 배경지도가 더 잘 보이고 중첩부의 색상 혼합이 강조됩니다.",
         )
         buffer_level = st.selectbox(
             "센서 상세보기 분류",
@@ -1138,7 +1199,7 @@ if (
         allowed_serials,
         selected_buffer_serial,
         analysis_cover_name,
-        buffer_opacity,
+        buffer_transparency,
     )
     relationship_group.add_to(map_object)
 
@@ -1163,7 +1224,7 @@ map_key_parts = [
     str(show_shp),
     str(shp_opacity),
     str(show_temperature_sensors),
-    str(buffer_opacity),
+    str(buffer_transparency),
     analysis_cover_name,
     buffer_level,
     str(min_buffer_coverage),
@@ -1306,6 +1367,119 @@ if show_temperature_sensors and buffer_stats is not None and sdot_snapshot is no
         "습지·농업지역·나지는 제외하고 녹지는 산림지역+초지로 계산했습니다. "
         "상관과 온도차는 탐색적 연관성이며 인과관계를 뜻하지 않습니다."
     )
+
+    st.subheader("산지 인접형에서 도심부로 갈수록 달라지는 온도")
+    _, urbanity_summary, urbanity_reason = build_urbanity_temperature_profile(
+        sensor_table
+    )
+    if urbanity_summary is None:
+        st.warning(str(urbanity_reason))
+    else:
+        zone_order = ["산지 인접형", "전이지대", "도심부"]
+        mountain_temperature = float(
+            urbanity_summary.loc[
+                urbanity_summary["공간 유형"] == "산지 인접형", "평균온도"
+            ].iloc[0]
+        )
+        urban_temperature = float(
+            urbanity_summary.loc[
+                urbanity_summary["공간 유형"] == "도심부", "평균온도"
+            ].iloc[0]
+        )
+        temperature_gap = urban_temperature - mountain_temperature
+
+        profile_metric1, profile_metric2, profile_metric3 = st.columns(3)
+        profile_metric1.metric("산지 인접형 평균", f"{mountain_temperature:.2f}℃")
+        profile_metric2.metric("도심부 평균", f"{urban_temperature:.2f}℃")
+        profile_metric3.metric(
+            "도심부 - 산지 인접형",
+            f"{temperature_gap:+.2f}℃",
+        )
+
+        profile_base = alt.Chart(urbanity_summary).encode(
+            x=alt.X(
+                "공간 유형:N",
+                title="토지피복 기반 위치 유형",
+                sort=zone_order,
+                axis=alt.Axis(labelAngle=0),
+            ),
+            tooltip=[
+                alt.Tooltip("공간 유형:N", title="구간"),
+                alt.Tooltip("센서수:Q", title="센서 수", format=",.0f"),
+                alt.Tooltip("평균온도:Q", title="평균 온도(℃)", format=".2f"),
+                alt.Tooltip(
+                    "평균시가화건조비율:Q",
+                    title="평균 시가화건조 비율(%)",
+                    format=".1f",
+                ),
+                alt.Tooltip("평균녹지비율:Q", title="평균 녹지 비율(%)", format=".1f"),
+            ],
+        )
+        interval_chart = profile_base.mark_rule(
+            color="#8c7a52",
+            strokeWidth=3,
+        ).encode(
+            y=alt.Y(
+                "신뢰구간 하한:Q",
+                title="평균 온도 (℃)",
+                scale=alt.Scale(zero=False),
+            ),
+            y2=alt.Y2("신뢰구간 상한:Q"),
+        )
+        line_chart = profile_base.mark_line(
+            color="#c88700",
+            strokeWidth=4,
+        ).encode(
+            y=alt.Y(
+                "평균온도:Q",
+                title="평균 온도 (℃)",
+                scale=alt.Scale(zero=False),
+            )
+        )
+        point_chart = profile_base.mark_circle(
+            size=150,
+            stroke="#ffffff",
+            strokeWidth=2,
+        ).encode(
+            y=alt.Y(
+                "평균온도:Q",
+                title="평균 온도 (℃)",
+                scale=alt.Scale(zero=False),
+            ),
+            color=alt.Color(
+                "공간 유형:N",
+                scale=alt.Scale(
+                    domain=zone_order,
+                    range=["#2f855a", "#d4a017", "#9a6700"],
+                ),
+                legend=None,
+            ),
+        )
+        label_chart = profile_base.mark_text(
+            dy=-16,
+            color="#493b1c",
+            fontWeight="bold",
+        ).encode(
+            y=alt.Y(
+                "평균온도:Q",
+                title="평균 온도 (℃)",
+                scale=alt.Scale(zero=False),
+            ),
+            text=alt.Text("평균온도:Q", format=".2f"),
+        )
+        st.altair_chart(
+            (interval_chart + line_chart + point_chart + label_chart).properties(
+                height=340
+            ),
+            width="stretch",
+        )
+        st.caption(
+            "도심성 지수 = 시가화건조지역 비율 - 녹지 비율입니다. "
+            "하위 1/3은 '산지 인접형', 중간 1/3은 '전이지대', 상위 1/3은 "
+            "'도심부'로 구분했습니다. 막대는 평균의 95% 신뢰구간입니다. "
+            "실제 산지까지의 거리를 측정한 결과가 아닌 토지피복 기반 탐색 지표이며, "
+            "관찰된 차이는 인과관계를 뜻하지 않습니다."
+        )
 else:
     st.info("S-DoT 온도센서 토글을 켜면 센서별 구성비와 온도 경향표가 표시됩니다.")
 
