@@ -1,8 +1,8 @@
 streamlit>=1.45,<2
 folium>=0.20,<1
-numpy>=1.26,<3
 streamlit-folium>=0.22,<1
 pandas>=2.2,<4
 pyarrow>=15,<25
 pillow>=10,<13
 statsmodels>=0.14.6,<1
+shapely>=2.0,<3
