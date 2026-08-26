@@ -14,6 +14,7 @@ import streamlit as st
 from branca.colormap import LinearColormap
 from folium.plugins import Fullscreen, LocateControl
 from folium.utilities import JsCode
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from streamlit_folium import st_folium
 
 
@@ -47,6 +48,36 @@ TEMPERATURE_COLUMN = "temperature_c"
 TEMPERATURE_MIN = -30.0
 TEMPERATURE_MAX = 50.0
 TEMPERATURE_COLORS = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
+
+# 사용자가 분석 제외를 요청한 대분류와 그 하위 분류 코드입니다.
+# 2=농업지역, 5=습지, 6=나지이며 지도 원본 오버레이에는 남겨 두되
+# 관계 지도·표·경향·회귀분석에서는 제외합니다.
+EXCLUDED_LARGE_CLASS_PREFIXES = {"2", "5", "6"}
+EXCLUDED_LARGE_CLASS_NAMES = {"농업지역", "습지", "나지"}
+
+# 분석에서는 산림지역과 초지를 하나의 '녹지' 변수로 합칩니다.
+ANALYSIS_COVER_COMPONENTS = {
+    "시가화건조지역": {"1"},
+    "녹지": {"3", "4"},
+    "수역": {"7"},
+}
+ANALYSIS_COVER_COLORS = {
+    "시가화건조지역(%)": "#d95f02",
+    "녹지(%)": "#2f855a",
+    "수역(%)": "#3182bd",
+}
+
+# ArcGIS의 3×3 이변량 색상 지도 원리를 적용한 팔레트입니다.
+# 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
+BIVARIATE_COLORS = [
+    ["#e8e8e8", "#ace4e4", "#5ac8c8"],
+    ["#dfb0d6", "#a5add3", "#5698b9"],
+    ["#be64ac", "#8c62aa", "#3b4994"],
+]
+BIVARIATE_REFERENCE = (
+    "https://pro.arcgis.com/en/pro-app/3.6/help/mapping/"
+    "layer-properties/bivariate-colors.htm"
+)
 
 
 def find_asset(file_name: str) -> Path | None:
@@ -85,6 +116,76 @@ def class_color(class_code: str) -> str:
     except ValueError:
         detail_offset = sum(ord(character) for character in code) % 40
     return f"hsl({(base_hue + detail_offset) % 360:.0f}, 68%, 46%)"
+
+
+def class_code_prefix(value: object) -> str:
+    """대·중·세분류 코드에서 대분류를 나타내는 첫 자리를 반환합니다."""
+    normalized = str(value).strip().split(".")[0]
+    return normalized[:1]
+
+
+def filter_analysis_landcover_rows(data: pd.DataFrame) -> pd.DataFrame:
+    """농업지역·습지·나지 및 해당 하위 분류를 분석 데이터에서 제외합니다."""
+    prefixes = data["class_code"].map(class_code_prefix)
+    names = data["class_name"].astype(str)
+    excluded = prefixes.isin(EXCLUDED_LARGE_CLASS_PREFIXES) | names.isin(
+        EXCLUDED_LARGE_CLASS_NAMES
+    )
+    return data.loc[~excluded].copy()
+
+
+def build_analysis_composition(
+    stats: pd.DataFrame,
+    min_coverage: float,
+) -> pd.DataFrame:
+    """센서별 시가화건조·녹지·수역 비율을 원래 피복면적 기준으로 계산합니다."""
+    large_all = stats[
+        (stats["level"] == "대분류")
+        & (pd.to_numeric(stats["coverage_pct"], errors="coerce") >= min_coverage)
+    ].copy()
+    if large_all.empty:
+        return pd.DataFrame(
+            columns=[*ANALYSIS_COVER_COMPONENTS, "SHP 피복률(%)"]
+        )
+
+    large_all["serial"] = large_all["serial"].astype(str)
+    large_all["share_pct"] = pd.to_numeric(large_all["share_pct"], errors="coerce").fillna(0)
+    coverage = large_all.groupby("serial")["coverage_pct"].first()
+    kept = filter_analysis_landcover_rows(large_all)
+    kept["large_prefix"] = kept["class_code"].map(class_code_prefix)
+
+    composition = pd.DataFrame(index=coverage.index)
+    for label, prefixes in ANALYSIS_COVER_COMPONENTS.items():
+        component = (
+            kept.loc[kept["large_prefix"].isin(prefixes)]
+            .groupby("serial")["share_pct"]
+            .sum()
+        )
+        composition[label] = component.reindex(composition.index, fill_value=0.0)
+
+    # 제외 대상만 존재하는 센서는 분석 표본에서 제거합니다.
+    composition = composition.loc[
+        composition[list(ANALYSIS_COVER_COMPONENTS)].sum(axis=1) > 0
+    ].copy()
+    composition["SHP 피복률(%)"] = coverage.reindex(composition.index)
+    return composition
+
+
+def tertile_thresholds(values: pd.Series) -> tuple[float, float]:
+    clean = pd.to_numeric(values, errors="coerce").dropna()
+    return float(clean.quantile(1 / 3)), float(clean.quantile(2 / 3))
+
+
+def tertile_class(value: float, thresholds: tuple[float, float]) -> int:
+    if value <= thresholds[0]:
+        return 0
+    if value <= thresholds[1]:
+        return 1
+    return 2
+
+
+def tertile_label(class_index: int) -> str:
+    return ("낮음", "중간", "높음")[class_index]
 
 
 def pie_chart_data_url(
@@ -307,10 +408,171 @@ def add_buffer_layer(
     return len(features)
 
 
+def add_bivariate_buffer_layer(
+    parent_group: folium.FeatureGroup,
+    map_object: folium.Map,
+    buffer_geojson: dict,
+    stats: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    min_coverage: float,
+    allowed_serials: set[str],
+    selected_serial: str | None,
+    cover_name: str,
+) -> int:
+    """선택 피복비율과 온도의 3×3 이변량 관계 지도를 추가합니다."""
+    composition = build_analysis_composition(stats, min_coverage)
+    if composition.empty or cover_name not in composition.columns:
+        return 0
+
+    temperature = snapshot[["serial", TEMPERATURE_COLUMN]].copy()
+    temperature["serial"] = temperature["serial"].astype(str)
+    temperature[TEMPERATURE_COLUMN] = pd.to_numeric(
+        temperature[TEMPERATURE_COLUMN], errors="coerce"
+    )
+    temperature = (
+        temperature.dropna(subset=[TEMPERATURE_COLUMN])
+        .drop_duplicates("serial", keep="last")
+        .set_index("serial")
+    )
+
+    analysis = composition[[cover_name]].join(temperature, how="inner")
+    analysis = analysis.loc[
+        analysis.index.astype(str).isin(allowed_serials)
+    ].copy()
+    if analysis.empty:
+        return 0
+
+    cover_thresholds = tertile_thresholds(analysis[cover_name])
+    temperature_thresholds = tertile_thresholds(analysis[TEMPERATURE_COLUMN])
+    analysis["cover_class"] = analysis[cover_name].map(
+        lambda value: tertile_class(float(value), cover_thresholds)
+    )
+    analysis["temperature_class"] = analysis[TEMPERATURE_COLUMN].map(
+        lambda value: tertile_class(float(value), temperature_thresholds)
+    )
+
+    features = []
+    for source_feature in buffer_geojson["features"]:
+        properties = dict(source_feature["properties"])
+        serial = str(properties["serial"])
+        if serial not in analysis.index:
+            continue
+        row = analysis.loc[serial]
+        cover_class = int(row["cover_class"])
+        temperature_class = int(row["temperature_class"])
+        properties.update(
+            {
+                "cover_name": cover_name,
+                "cover_share": round(float(row[cover_name]), 2),
+                "temperature_c": round(float(row[TEMPERATURE_COLUMN]), 2),
+                "cover_level": tertile_label(cover_class),
+                "temperature_level": tertile_label(temperature_class),
+                "bivariate_color": BIVARIATE_COLORS[temperature_class][cover_class],
+                "coverage_pct": round(float(properties.get("coverage_pct", 0)), 2),
+                "selected": serial == selected_serial,
+            }
+        )
+        features.append(
+            {
+                "type": "Feature",
+                "properties": properties,
+                "geometry": source_feature["geometry"],
+            }
+        )
+
+    def style_function(feature: dict) -> dict:
+        properties = feature["properties"]
+        return {
+            "color": "#111827" if properties["selected"] else "#ffffff",
+            "fillColor": properties["bivariate_color"],
+            "weight": 4 if properties["selected"] else 1.4,
+            "fillOpacity": 0.82 if properties["selected"] else 0.68,
+            "dashArray": None if properties["coverage_pct"] >= 99 else "5 4",
+        }
+
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        name=f"{cover_name} × 온도",
+        style_function=style_function,
+        highlight_function=lambda _: {
+            "weight": 3,
+            "color": "#111827",
+            "fillOpacity": 0.84,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=[
+                "serial",
+                "address",
+                "cover_share",
+                "temperature_c",
+                "cover_level",
+                "temperature_level",
+                "coverage_pct",
+            ],
+            aliases=[
+                "센서",
+                "주소",
+                f"{cover_name} 비율(%)",
+                "온도(℃)",
+                f"{cover_name} 삼분위",
+                "온도 삼분위",
+                "SHP 피복률(%)",
+            ],
+            localize=True,
+            sticky=True,
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=["serial", "cover_share", "temperature_c"],
+            aliases=["센서", f"{cover_name} 비율(%)", "온도(℃)"],
+            localize=True,
+        ),
+        show=True,
+        control=False,
+    ).add_to(parent_group)
+
+    legend_cells = []
+    for temperature_class in (2, 1, 0):
+        legend_cells.append(
+            f'<span style="font-size:10px;text-align:right;padding-right:3px">'
+            f'{tertile_label(temperature_class)}</span>'
+        )
+        for cover_class in (0, 1, 2):
+            color = BIVARIATE_COLORS[temperature_class][cover_class]
+            legend_cells.append(
+                f'<span style="width:27px;height:27px;background:{color};'
+                f'display:block;border:1px solid rgba(255,255,255,.65)"></span>'
+            )
+    legend_html = f"""
+    <div style="position:fixed;right:14px;bottom:38px;z-index:9999;
+                background:rgba(255,255,255,.95);color:#18201e;padding:10px 12px;
+                border-radius:7px;border:1px solid #cdd6d2;font:11px/1.35 sans-serif;
+                box-shadow:0 1px 5px rgba(0,0,0,.18)">
+      <b>{escape(cover_name)} 비율 × 온도</b>
+      <div style="margin-top:6px;display:grid;grid-template-columns:34px repeat(3,27px);
+                  gap:1px;align-items:center">
+        {''.join(legend_cells)}
+        <span></span><span style="text-align:center">낮음</span>
+        <span style="text-align:center">중간</span><span style="text-align:center">높음</span>
+      </div>
+      <div style="margin:4px 0 0 35px;text-align:center">{escape(cover_name)} 비율 →</div>
+      <div style="position:absolute;left:3px;top:56px;writing-mode:vertical-rl;
+                  transform:rotate(180deg)">온도 →</div>
+      <div style="margin-top:6px;color:#59635f;border-top:1px solid #d7dfdc;padding-top:5px">
+        각 변수 삼분위 · n={len(features)}<br>
+        피복 경계 {cover_thresholds[0]:.1f}, {cover_thresholds[1]:.1f}% ·
+        온도 경계 {temperature_thresholds[0]:.1f}, {temperature_thresholds[1]:.1f}℃
+      </div>
+    </div>
+    """
+    map_object.get_root().html.add_child(folium.Element(legend_html))
+    return len(features)
+
+
 def add_temperature_points(
     parent_group: folium.FeatureGroup,
     map_object: folium.Map,
     data: pd.DataFrame,
+    show_legend: bool = True,
 ) -> None:
     data = data.dropna(subset=[TEMPERATURE_COLUMN]).copy()
     measured = data[TEMPERATURE_COLUMN].dropna()
@@ -349,7 +611,7 @@ def add_temperature_points(
             popup=folium.Popup(popup_html, max_width=330),
         ).add_to(parent_group)
 
-    if not measured.empty:
+    if show_legend and not measured.empty:
         gradient = ",".join(TEMPERATURE_COLORS)
         legend_html = f"""
         <div style="position:fixed;right:14px;bottom:42px;z-index:9999;width:210px;
@@ -371,33 +633,36 @@ def build_sensor_table(
     snapshot: pd.DataFrame,
     min_coverage: float,
 ) -> tuple[pd.DataFrame, list[str]]:
+    """분석 대상 대분류만 사용해 센서별 피복 구성표를 만듭니다."""
     snapshot = snapshot.dropna(subset=[TEMPERATURE_COLUMN]).copy()
-    large_class = stats[stats["level"] == "대분류"].copy()
-    large_class = large_class[large_class["coverage_pct"] >= min_coverage]
-    composition = large_class.pivot_table(
-        index="serial",
-        columns="class_name",
-        values="share_pct",
-        aggfunc="sum",
-        fill_value=0,
+    snapshot["serial"] = snapshot["serial"].astype(str)
+
+    analysis_composition = build_analysis_composition(stats, min_coverage)
+    if analysis_composition.empty:
+        return pd.DataFrame(), []
+
+    cover_labels = list(ANALYSIS_COVER_COMPONENTS)
+    composition = analysis_composition[cover_labels].rename(
+        columns={label: f"{label}(%)" for label in cover_labels}
     )
-    composition.columns = [f"{column}(%)" for column in composition.columns]
     composition_columns = list(composition.columns)
     class_colors = {
-        f"{row.class_name}(%)": class_color(str(row.class_code))
-        for row in large_class.drop_duplicates("class_name").itertuples(index=False)
+        column: ANALYSIS_COVER_COLORS[column] for column in composition_columns
     }
 
-    dominant_indexes = large_class.groupby("serial")["share_pct"].idxmax()
-    dominant = large_class.loc[
-        dominant_indexes, ["serial", "class_name", "share_pct", "coverage_pct"]
-    ].rename(
-        columns={
-            "class_name": "우세 용도",
-            "share_pct": "우세 비율(%)",
-            "coverage_pct": "SHP 피복률(%)",
+    dominant_label = composition.idxmax(axis=1).str.removesuffix("(%)")
+    dominant_share = composition.max(axis=1)
+    dominant = pd.DataFrame(
+        {
+            "serial": composition.index.astype(str),
+            "우세 용도": dominant_label.to_numpy(),
+            "우세 비율(%)": dominant_share.to_numpy(),
+            "SHP 피복률(%)": analysis_composition["SHP 피복률(%)"].to_numpy(),
         }
     )
+    composition = composition.reset_index().rename(columns={"index": "serial"})
+    composition["serial"] = composition["serial"].astype(str)
+
     sensor_columns = [
         "serial",
         "district",
@@ -419,8 +684,15 @@ def build_sensor_table(
             }
         )
     )
-    numeric_columns = ["온도(℃)", "SHP 피복률(%)", "우세 비율(%)", *composition_columns]
-    table[numeric_columns] = table[numeric_columns].round(2)
+    numeric_columns = [
+        "온도(℃)",
+        "SHP 피복률(%)",
+        "우세 비율(%)",
+        *composition_columns,
+    ]
+    table[numeric_columns] = table[numeric_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).round(2)
     pie_column_position = table.columns.get_loc("온도(℃)") + 1
     table.insert(
         pie_column_position,
@@ -480,98 +752,130 @@ def build_trend_table(sensor_table: pd.DataFrame, composition_columns: list[str]
     return trend
 
 
-def build_urban_share_regression(
+def build_landcover_multiple_regression(
     sensor_table: pd.DataFrame,
-) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None, dict[str, object]]:
-    """시가화건조지역 구성비와 온도의 선형관계를 OLS로 추정합니다."""
-    share_column = "시가화건조지역(%)"
-    required_columns = ["센서", "자치구", share_column, "온도(℃)"]
-    missing_columns = [column for column in required_columns if column not in sensor_table.columns]
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, dict[str, object]]:
+    """시가화건조·녹지·수역 비율로 온도를 설명하는 다중 OLS를 추정합니다."""
+    predictor_columns = [
+        "시가화건조지역(%)",
+        "녹지(%)",
+        "수역(%)",
+    ]
+    required_columns = ["센서", "자치구", *predictor_columns, "온도(℃)"]
+    missing_columns = [
+        column for column in required_columns if column not in sensor_table.columns
+    ]
     if missing_columns:
-        return None, None, None, {
+        return None, None, {
             "reason": f"회귀분석에 필요한 열이 없습니다: {', '.join(missing_columns)}"
         }
 
     analysis = sensor_table[required_columns].copy()
-    analysis[share_column] = pd.to_numeric(analysis[share_column], errors="coerce")
-    analysis["온도(℃)"] = pd.to_numeric(analysis["온도(℃)"], errors="coerce")
-    analysis = analysis.dropna(subset=[share_column, "온도(℃)"])
-    analysis = analysis[analysis[share_column].between(0, 100)].copy()
-    analysis = analysis.rename(columns={share_column: "시가화건조지역 비율(%)"})
+    numeric_columns = [*predictor_columns, "온도(℃)"]
+    analysis[numeric_columns] = analysis[numeric_columns].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    analysis = analysis.dropna(subset=numeric_columns)
+    for column in predictor_columns:
+        analysis = analysis[analysis[column].between(0, 100)]
 
-    if len(analysis) < 5:
-        return None, None, None, {"reason": "유효한 센서가 5개 이상 필요합니다."}
-    if analysis["시가화건조지역 비율(%)"].nunique() < 2:
-        return None, None, None, {"reason": "시가화건조지역 비율에 변화가 없어 회귀계수를 계산할 수 없습니다."}
+    varying_predictors = [
+        column
+        for column in predictor_columns
+        if analysis[column].nunique() >= 2 and float(analysis[column].std()) > 0
+    ]
+    dropped_predictors = [
+        column for column in predictor_columns if column not in varying_predictors
+    ]
+    minimum_rows = max(10, len(varying_predictors) + 3)
+    if len(analysis) < minimum_rows:
+        return None, None, {
+            "reason": f"유효한 센서가 최소 {minimum_rows}개 필요합니다."
+        }
+    if len(varying_predictors) < 2:
+        return None, None, {
+            "reason": "선택 조건에서 변화가 있는 피복 변수가 2개 미만이라 다중회귀를 계산할 수 없습니다."
+        }
 
-    design = pd.DataFrame(
-        {
-            "const": 1.0,
-            "urban_share_pct": analysis["시가화건조지역 비율(%)"].astype(float),
-        },
-        index=analysis.index,
+    design = sm.add_constant(
+        analysis[varying_predictors].astype(float),
+        has_constant="add",
     )
     model = sm.OLS(analysis["온도(℃)"].astype(float), design).fit(
         cov_type="HC3",
         use_t=True,
     )
     confidence = model.conf_int(alpha=0.05)
-    coefficient_1pct = float(model.params["urban_share_pct"])
-    standard_error_1pct = float(model.bse["urban_share_pct"])
-    lower_1pct = float(confidence.loc["urban_share_pct", 0])
-    upper_1pct = float(confidence.loc["urban_share_pct", 1])
-    p_value = float(model.pvalues["urban_share_pct"])
+    response_std = float(analysis["온도(℃)"].std())
 
-    if p_value < 0.05 and coefficient_1pct > 0:
-        judgement = "시가화 비중 증가와 유의한 온도 상승 관련"
-    elif p_value < 0.05:
-        judgement = "시가화 비중 증가와 유의한 온도 하락 관련"
-    else:
-        judgement = "통계적으로 유의한 선형관계 없음"
+    design_values = design.to_numpy()
+    vif_by_predictor = {
+        predictor: float(
+            variance_inflation_factor(
+                design_values,
+                design.columns.get_loc(predictor),
+            )
+        )
+        for predictor in varying_predictors
+    }
 
-    coefficient_table = pd.DataFrame(
-        [
+    rows = []
+    for predictor in varying_predictors:
+        coefficient_1pct = float(model.params[predictor])
+        standard_error_1pct = float(model.bse[predictor])
+        lower_1pct = float(confidence.loc[predictor, 0])
+        upper_1pct = float(confidence.loc[predictor, 1])
+        p_value = float(model.pvalues[predictor])
+        standardized_beta = (
+            coefficient_1pct * float(analysis[predictor].std()) / response_std
+            if response_std > 0
+            else float("nan")
+        )
+        if p_value < 0.05 and coefficient_1pct > 0:
+            judgement = "다른 피복비율 통제 후 유의한 온도 상승 관련"
+        elif p_value < 0.05:
+            judgement = "다른 피복비율 통제 후 유의한 온도 하락 관련"
+        else:
+            judgement = "통계적으로 유의하지 않음"
+        rows.append(
             {
-                "독립변수": "시가화건조지역 비율 10%p 증가",
-                "온도 변화(℃)": coefficient_1pct * 10,
+                "독립변수": predictor.removesuffix("(%)"),
+                "10%p 증가 시 온도 변화(℃)": coefficient_1pct * 10,
                 "표준오차": standard_error_1pct * 10,
                 "95% 하한(℃)": lower_1pct * 10,
                 "95% 상한(℃)": upper_1pct * 10,
+                "표준화 계수": standardized_beta,
                 "p값": p_value,
+                "VIF": vif_by_predictor[predictor],
                 "판정": judgement,
             }
-        ]
-    )
-    numeric_columns = ["온도 변화(℃)", "표준오차", "95% 하한(℃)", "95% 상한(℃)", "p값"]
-    coefficient_table[numeric_columns] = coefficient_table[numeric_columns].round(4)
+        )
 
-    share_min = float(analysis["시가화건조지역 비율(%)"].min())
-    share_max = float(analysis["시가화건조지역 비율(%)"].max())
-    grid_count = 101
-    share_grid = [
-        share_min + (share_max - share_min) * index / (grid_count - 1)
-        for index in range(grid_count)
+    coefficient_table = pd.DataFrame(rows)
+    numeric_output_columns = [
+        "10%p 증가 시 온도 변화(℃)",
+        "표준오차",
+        "95% 하한(℃)",
+        "95% 상한(℃)",
+        "표준화 계수",
+        "p값",
+        "VIF",
     ]
-    prediction_design = pd.DataFrame({"const": 1.0, "urban_share_pct": share_grid})
-    prediction = model.get_prediction(prediction_design).summary_frame(alpha=0.05)
-    prediction_curve = pd.DataFrame(
-        {
-            "시가화건조지역 비율(%)": share_grid,
-            "예측온도(℃)": prediction["mean"].to_numpy(),
-            "95% 하한(℃)": prediction["mean_ci_lower"].to_numpy(),
-            "95% 상한(℃)": prediction["mean_ci_upper"].to_numpy(),
-        }
-    )
+    coefficient_table[numeric_output_columns] = coefficient_table[
+        numeric_output_columns
+    ].round(4)
 
-    return analysis, prediction_curve, coefficient_table, {
+    analysis = analysis.copy()
+    analysis["예측온도(℃)"] = model.fittedvalues
+    analysis["잔차(℃)"] = model.resid
+    return analysis, coefficient_table, {
         "nobs": int(model.nobs),
         "r_squared": float(model.rsquared),
         "adjusted_r_squared": float(model.rsquared_adj),
-        "coefficient_10pct": coefficient_1pct * 10,
-        "p_value": p_value,
-        "share_min": share_min,
-        "share_max": share_max,
-        "judgement": judgement,
+        "model_p_value": float(model.f_pvalue),
+        "predictors": varying_predictors,
+        "dropped_predictors": dropped_predictors,
+        "max_vif": max(vif_by_predictor.values()),
     }
 
 
@@ -603,6 +907,7 @@ selected_timestamp: pd.Timestamp | None = None
 buffer_level = "대분류"
 min_buffer_coverage = 50.0
 selected_district = "전체"
+analysis_cover_name = "시가화건조지역"
 
 with st.sidebar:
     st.header("지도 설정")
@@ -611,7 +916,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("토지피복 SHP")
-    show_shp = st.toggle("2024 세분류 토지피복", value=True)
+    show_shp = st.toggle("2024 세분류 토지피복", value=False)
     shp_opacity = st.slider("토지피복 투명도", 0.1, 1.0, 0.72, 0.05, disabled=not show_shp)
     shp_image_path = find_asset(SHP_IMAGE_FILE_NAME)
     shp_meta_path = find_asset(SHP_META_FILE_NAME)
@@ -652,7 +957,15 @@ with st.sidebar:
         )
         districts = ["전체", *sorted(sdot_data["district"].dropna().astype(str).unique())]
         selected_district = st.selectbox("자치구", districts)
-        buffer_level = st.selectbox("버퍼 토지피복 분류", ["대분류", "중분류", "세분류"])
+        analysis_cover_name = st.selectbox(
+            "관계 지도 피복변수",
+            list(ANALYSIS_COVER_COMPONENTS),
+            help="녹지는 산림지역과 초지의 합입니다.",
+        )
+        buffer_level = st.selectbox(
+            "센서 상세보기 분류",
+            ["대분류", "중분류", "세분류"],
+        )
         min_buffer_coverage = st.slider(
             "최소 SHP 피복률(%)",
             0,
@@ -693,7 +1006,7 @@ with st.sidebar:
         if selected_option != "선택 안 함":
             selected_buffer_serial = selected_option
 
-    st.caption("지도 레이어 메뉴에서 토지피복과 온도센서를 각각 켜고 끌 수 있습니다.")
+    st.caption("기본 지도는 선택 피복비율과 온도를 한 색으로 결합한 3×3 이변량 지도입니다.")
 
 if show_temperature_sensors and sdot_snapshot is not None:
     valid_temperatures = sdot_snapshot[TEMPERATURE_COLUMN].dropna()
@@ -715,6 +1028,11 @@ if selected_buffer_serial and buffer_geojson is not None:
     center = [float(selected_properties["latitude"]), float(selected_properties["longitude"])]
     zoom = 16
 
+st.subheader(f"{analysis_cover_name} 비율과 온도의 공간적 관계")
+st.caption(
+    "버퍼 색상 하나에 피복비율과 온도의 낮음·중간·높음 조합을 표시합니다. "
+    "오른쪽 아래 3×3 범례에서 두 변수가 동시에 높은 영역을 바로 확인할 수 있습니다."
+)
 map_object = build_base_map(center, zoom, selected_basemap)
 
 if show_shp and shp_image_path is not None and shp_meta_path is not None:
@@ -732,19 +1050,37 @@ if (
     and buffer_geojson is not None
     and buffer_stats is not None
 ):
-    sensor_group = folium.FeatureGroup(name="S-DoT 온도센서", show=True, control=True)
     allowed_serials = set(sdot_snapshot["serial"].astype(str))
-    visible_buffer_count = add_buffer_layer(
-        sensor_group,
+    relationship_group = folium.FeatureGroup(
+        name=f"{analysis_cover_name} 비율 × 온도",
+        show=True,
+        control=True,
+    )
+    visible_buffer_count = add_bivariate_buffer_layer(
+        relationship_group,
+        map_object,
         buffer_geojson,
         buffer_stats,
-        buffer_level,
+        sdot_snapshot,
         min_buffer_coverage,
         allowed_serials,
         selected_buffer_serial,
+        analysis_cover_name,
     )
-    add_temperature_points(sensor_group, map_object, sdot_snapshot)
-    sensor_group.add_to(map_object)
+    relationship_group.add_to(map_object)
+
+    point_group = folium.FeatureGroup(
+        name="S-DoT 측정지점",
+        show=True,
+        control=True,
+    )
+    add_temperature_points(
+        point_group,
+        map_object,
+        sdot_snapshot,
+        show_legend=False,
+    )
+    point_group.add_to(map_object)
 
 folium.LayerControl(collapsed=False, position="topright").add_to(map_object)
 
@@ -754,6 +1090,7 @@ map_key_parts = [
     str(show_shp),
     str(shp_opacity),
     str(show_temperature_sensors),
+    analysis_cover_name,
     buffer_level,
     str(min_buffer_coverage),
     str(selected_buffer_serial),
@@ -827,7 +1164,10 @@ if show_temperature_sensors and buffer_stats is not None and sdot_snapshot is no
         selected_composition = buffer_stats[
             (buffer_stats["serial"] == selected_buffer_serial)
             & (buffer_stats["level"] == buffer_level)
-        ].sort_values("share_pct", ascending=False)
+        ].copy()
+        selected_composition = filter_analysis_landcover_rows(
+            selected_composition
+        ).sort_values("share_pct", ascending=False)
         if not selected_composition.empty:
             selected_coverage = float(selected_composition["coverage_pct"].iloc[0])
             dominant_row = selected_composition.iloc[0]
@@ -889,6 +1229,7 @@ if show_temperature_sensors and buffer_stats is not None and sdot_snapshot is no
     )
     st.caption(
         f"현재 시각의 유효 온도 센서 {sensor_table['온도(℃)'].notna().sum()}개를 사용했습니다. "
+        "습지·농업지역·나지는 제외하고 녹지는 산림지역+초지로 계산했습니다. "
         "상관과 온도차는 탐색적 연관성이며 인과관계를 뜻하지 않습니다."
     )
 else:
@@ -900,6 +1241,10 @@ with st.expander("데이터 및 분석 기준"):
         - **SHP:** 7개 원본 파일, 97,018개 세분류 폴리곤, 약 2m 래스터 해상도
         - **버퍼:** S-DoT 위치 중심 반경 300m
         - **구성비:** 버퍼 내 SHP 피복면적 대비 각 용도 교차면적
+        - **분석 대분류:** 시가화건조지역, 녹지(산림지역+초지), 수역
+        - **분석 제외:** 습지, 농업지역, 나지와 해당 하위 분류
+        - **이변량 지도:** 피복비율과 온도를 각각 삼분위로 나눈 3×3 관계 색상
+          ([ArcGIS Bivariate colors 설계 참고]({BIVARIATE_REFERENCE}))
         - **온도 유효범위:** {TEMPERATURE_MIN:.0f}℃ 이상 {TEMPERATURE_MAX:.0f}℃ 이하
         - **S-DoT 기간:** 2026-07-20 00:07 ~ 2026-07-26 23:07
         - **토지피복 출처:** [기후에너지환경부 환경공간정보서비스]({LAND_COVER_SOURCE})
@@ -913,102 +1258,188 @@ with st.expander("데이터 및 분석 기준"):
 st.caption("자료 출처: 사용자 제공 2024 토지피복 SHP · 서울특별시 서울열린데이터광장")
 
 st.divider()
-st.subheader("시가화건조지역 비중과 온도 OLS 회귀분석")
+st.subheader("대분류 피복비율 다중선형회귀분석")
+st.caption(
+    "X: 시가화건조지역 비율, 녹지 비율(산림지역+초지), 수역 비율 · "
+    "Y: 현재 선택 시각의 S-DoT 온도"
+)
 if show_temperature_sensors and sensor_table is not None and not sensor_table.empty:
-    regression_data, prediction_curve, regression_table, regression_info = (
-        build_urban_share_regression(sensor_table)
+    regression_data, regression_table, regression_info = (
+        build_landcover_multiple_regression(sensor_table)
     )
-    if regression_data is None or prediction_curve is None or regression_table is None:
+    if regression_data is None or regression_table is None:
         st.warning(str(regression_info["reason"]))
     else:
+        model_p_value = float(regression_info["model_p_value"])
         metric1, metric2, metric3, metric4 = st.columns(4)
         metric1.metric("분석 센서", f"{int(regression_info['nobs']):,}개")
-        coefficient_10pct = float(regression_info["coefficient_10pct"])
-        metric2.metric("시가화 비율 10%p 증가", f"{coefficient_10pct:+.3f} ℃")
-        metric3.metric("설명력 R²", f"{float(regression_info['r_squared']):.3f}")
-        p_value = float(regression_info["p_value"])
-        metric4.metric("계수 p값", "<0.0001" if p_value < 0.0001 else f"{p_value:.4f}")
+        metric2.metric("설명력 R²", f"{float(regression_info['r_squared']):.3f}")
+        metric3.metric(
+            "조정 R²",
+            f"{float(regression_info['adjusted_r_squared']):.3f}",
+        )
+        metric4.metric(
+            "모형 p값",
+            "<0.0001" if model_p_value < 0.0001 else f"{model_p_value:.4f}",
+        )
 
-        effect_lower = float(regression_table.iloc[0]["95% 하한(℃)"])
-        effect_upper = float(regression_table.iloc[0]["95% 상한(℃)"])
-        p_text = "p<0.0001" if p_value < 0.0001 else f"p={p_value:.4f}"
-        if p_value < 0.05 and coefficient_10pct > 0:
-            st.success(
-                f"현재 선택 조건에서는 시가화건조지역 비율이 10%p 증가할 때 온도가 평균 "
-                f"{coefficient_10pct:.3f}℃ 높아지는 통계적으로 유의한 양(+)의 관계가 나타났습니다 "
-                f"(95% 신뢰구간 {effect_lower:.3f}~{effect_upper:.3f}℃, {p_text})."
+        dropped_predictors = regression_info["dropped_predictors"]
+        if dropped_predictors:
+            dropped_text = ", ".join(
+                predictor.removesuffix("(%)")
+                for predictor in dropped_predictors
             )
-        elif p_value < 0.05:
             st.warning(
-                f"현재 선택 조건에서는 시가화건조지역 비율이 10%p 증가할 때 온도가 평균 "
-                f"{abs(coefficient_10pct):.3f}℃ 낮아지는 통계적으로 유의한 음(-)의 관계가 나타났습니다 "
-                f"(95% 신뢰구간 {effect_lower:.3f}~{effect_upper:.3f}℃, {p_text})."
+                f"선택 조건에서 값의 변화가 없는 변수는 회귀식에서 제외했습니다: {dropped_text}"
+            )
+
+        significant = regression_table[regression_table["p값"] < 0.05]
+        if significant.empty:
+            st.info(
+                "다른 피복비율을 함께 통제한 결과, p<0.05 기준으로 유의한 개별 피복변수는 없었습니다."
             )
         else:
-            st.info(
-                f"현재 선택 조건에서는 시가화건조지역 비율과 온도의 선형관계가 통계적으로 "
-                f"유의하지 않았습니다 (10%p당 {coefficient_10pct:+.3f}℃, {p_text})."
+            strongest_index = significant["표준화 계수"].abs().idxmax()
+            strongest = significant.loc[strongest_index]
+            direction = (
+                "높아지는"
+                if strongest["10%p 증가 시 온도 변화(℃)"] > 0
+                else "낮아지는"
+            )
+            st.success(
+                f"유의 변수 중 표준화 효과가 가장 큰 항목은 {strongest['독립변수']}입니다. "
+                f"다른 피복비율이 같을 때 이 비율이 10%p 증가하면 온도가 평균 "
+                f"{abs(float(strongest['10%p 증가 시 온도 변화(℃)'])):.3f}℃ "
+                f"{direction} 관계로 추정됐습니다."
             )
 
-        scatter = alt.Chart(regression_data).mark_circle(size=64, opacity=0.58).encode(
-            x=alt.X(
-                "시가화건조지역 비율(%):Q",
-                title="300m 버퍼 내 시가화건조지역 비율 (%)",
-                scale=alt.Scale(zero=False),
-            ),
-            y=alt.Y("온도(℃):Q", title="S-DoT 온도 (℃)", scale=alt.Scale(zero=False)),
-            color=alt.value("#4d8073"),
-            tooltip=[
-                alt.Tooltip("센서:N"),
-                alt.Tooltip("자치구:N"),
-                alt.Tooltip("시가화건조지역 비율(%):Q", format=".2f"),
-                alt.Tooltip("온도(℃):Q", format=".2f"),
-            ],
+        if float(regression_info["max_vif"]) >= 5:
+            st.warning(
+                "일부 변수의 VIF가 5 이상입니다. 토지피복 비율은 서로 연관된 구성자료이므로 "
+                "개별 회귀계수 해석에 주의하세요."
+            )
+
+        interval = (
+            alt.Chart(regression_table)
+            .mark_rule(strokeWidth=3)
+            .encode(
+                y=alt.Y("독립변수:N", title=None),
+                x=alt.X(
+                    "95% 하한(℃):Q",
+                    title="피복비율 10%p 증가 시 온도 변화 (℃)",
+                ),
+                x2="95% 상한(℃):Q",
+                color=alt.value("#718096"),
+                tooltip=[
+                    alt.Tooltip("독립변수:N"),
+                    alt.Tooltip(
+                        "10%p 증가 시 온도 변화(℃):Q",
+                        title="추정 온도변화(℃)",
+                        format="+.3f",
+                    ),
+                    alt.Tooltip("95% 하한(℃):Q", format="+.3f"),
+                    alt.Tooltip("95% 상한(℃):Q", format="+.3f"),
+                    alt.Tooltip("p값:Q", format=".4f"),
+                    alt.Tooltip("VIF:Q", format=".2f"),
+                ],
+            )
         )
-        confidence_band = alt.Chart(prediction_curve).mark_area(
-            color="#d95f02",
-            opacity=0.16,
-        ).encode(
-            x=alt.X("시가화건조지역 비율(%):Q"),
-            y=alt.Y("95% 하한(℃):Q"),
-            y2="95% 상한(℃):Q",
+        estimates = (
+            alt.Chart(regression_table)
+            .mark_point(filled=True, size=110, color="#d95f02")
+            .encode(
+                y=alt.Y("독립변수:N", title=None),
+                x=alt.X("10%p 증가 시 온도 변화(℃):Q"),
+            )
         )
-        regression_line = alt.Chart(prediction_curve).mark_line(
-            color="#d95f02",
-            strokeWidth=3,
-        ).encode(
-            x=alt.X("시가화건조지역 비율(%):Q"),
-            y=alt.Y("예측온도(℃):Q"),
-            tooltip=[
-                alt.Tooltip("시가화건조지역 비율(%):Q", format=".1f"),
-                alt.Tooltip("예측온도(℃):Q", format=".2f"),
-                alt.Tooltip("95% 하한(℃):Q", format=".2f"),
-                alt.Tooltip("95% 상한(℃):Q", format=".2f"),
-            ],
+        zero_line = (
+            alt.Chart(pd.DataFrame({"기준": [0.0]}))
+            .mark_rule(color="#2d3748", strokeDash=[5, 4])
+            .encode(x="기준:Q")
         )
-        st.altair_chart(
-            (confidence_band + regression_line + scatter).properties(height=420),
-            width="stretch",
+        coefficient_chart = (zero_line + interval + estimates).properties(
+            height=240,
+            title="회귀계수와 95% 신뢰구간",
         )
+
+        observed_min = float(
+            min(
+                regression_data["온도(℃)"].min(),
+                regression_data["예측온도(℃)"].min(),
+            )
+        )
+        observed_max = float(
+            max(
+                regression_data["온도(℃)"].max(),
+                regression_data["예측온도(℃)"].max(),
+            )
+        )
+        identity_data = pd.DataFrame(
+            {
+                "예측온도(℃)": [observed_min, observed_max],
+                "관측온도(℃)": [observed_min, observed_max],
+            }
+        )
+        prediction_points = (
+            alt.Chart(regression_data)
+            .mark_circle(size=65, opacity=0.62, color="#4d8073")
+            .encode(
+                x=alt.X(
+                    "예측온도(℃):Q",
+                    title="모형 예측온도 (℃)",
+                    scale=alt.Scale(zero=False),
+                ),
+                y=alt.Y(
+                    "온도(℃):Q",
+                    title="관측온도 (℃)",
+                    scale=alt.Scale(zero=False),
+                ),
+                tooltip=[
+                    alt.Tooltip("센서:N"),
+                    alt.Tooltip("자치구:N"),
+                    alt.Tooltip("예측온도(℃):Q", format=".2f"),
+                    alt.Tooltip("온도(℃):Q", title="관측온도(℃)", format=".2f"),
+                    alt.Tooltip("잔차(℃):Q", format="+.2f"),
+                ],
+            )
+        )
+        identity_line = (
+            alt.Chart(identity_data)
+            .mark_line(color="#718096", strokeDash=[5, 4])
+            .encode(x="예측온도(℃):Q", y="관측온도(℃):Q")
+        )
+        prediction_chart = (identity_line + prediction_points).properties(
+            height=300,
+            title="관측온도와 모형 예측온도",
+        )
+
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.altair_chart(coefficient_chart, width="stretch")
+        with chart_col2:
+            st.altair_chart(prediction_chart, width="stretch")
 
         st.dataframe(
             regression_table,
             hide_index=True,
             width="stretch",
             column_config={
-                "온도 변화(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
+                "10%p 증가 시 온도 변화(℃)": st.column_config.NumberColumn(
+                    format="%+.3f ℃"
+                ),
                 "표준오차": st.column_config.NumberColumn(format="%.3f"),
                 "95% 하한(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
                 "95% 상한(℃)": st.column_config.NumberColumn(format="%+.3f ℃"),
+                "표준화 계수": st.column_config.NumberColumn(format="%+.3f"),
                 "p값": st.column_config.NumberColumn(format="%.4f"),
+                "VIF": st.column_config.NumberColumn(format="%.2f"),
             },
         )
         st.caption(
-            f"종속변수는 현재 선택 시각의 센서 온도, 독립변수는 300m 버퍼 내 시가화건조지역 비율입니다. "
-            f"분석된 비율 범위는 {float(regression_info['share_min']):.1f}%~"
-            f"{float(regression_info['share_max']):.1f}%이며, 계수와 평균 예측값의 95% 신뢰구간은 "
-            "HC3 강건 표준오차를 사용했습니다. p<0.05는 통계적 연관성을 뜻하지만 "
-            "다른 환경요인을 통제한 인과효과를 의미하지 않습니다."
+            "OLS에 HC3 강건 표준오차를 적용했습니다. 습지·농업지역·나지는 모든 분석에서 제외했고, "
+            "녹지는 산림지역과 초지의 합으로 계산했습니다. 비율은 제외 후 재정규화하지 않아 "
+            "원래 300m 버퍼 내 피복면적 기준을 유지합니다. p<0.05는 조건부 연관성을 뜻하며 "
+            "인과효과를 의미하지 않습니다."
         )
 else:
-    st.info("S-DoT 온도센서 토글을 켜면 시가화 비중과 온도의 OLS 회귀분석이 표시됩니다.")
+    st.info("S-DoT 온도센서 토글을 켜면 대분류 피복비율 다중회귀분석이 표시됩니다.")
