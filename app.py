@@ -3,7 +3,6 @@ from __future__ import annotations
 from html import escape
 import gzip
 import json
-import math
 from pathlib import Path
 from urllib.parse import quote
 
@@ -15,10 +14,6 @@ import streamlit as st
 from branca.colormap import LinearColormap
 from folium.plugins import Fullscreen, LocateControl
 from folium.utilities import JsCode
-from shapely import voronoi_polygons
-from shapely.affinity import scale
-from shapely.geometry import MultiPoint, Point, mapping, shape
-from shapely.ops import unary_union
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from streamlit_folium import st_folium
 
@@ -416,109 +411,43 @@ def add_buffer_layer(
 
 
 
-def partition_overlapping_buffers_as_union(features: list[dict]) -> list[dict]:
-    """중첩 버퍼를 최근접 센서 영역으로 분할해 합집합을 한 번만 채웁니다."""
-    if len(features) <= 1:
-        return features
 
-    records = []
-    for feature in features:
-        properties = feature["properties"]
-        geometry = shape(feature["geometry"])
-        if geometry.is_empty:
-            continue
-        longitude = pd.to_numeric(properties.get("longitude"), errors="coerce")
-        latitude = pd.to_numeric(properties.get("latitude"), errors="coerce")
-        if pd.isna(longitude) or pd.isna(latitude):
-            center = geometry.centroid
-            longitude, latitude = center.x, center.y
-        records.append(
-            {
-                "feature": feature,
-                "geometry": geometry,
-                "point": Point(float(longitude), float(latitude)),
-            }
-        )
-    if len(records) <= 1:
-        return [record["feature"] for record in records]
 
-    coordinate_count = len(
-        {(record["point"].x, record["point"].y) for record in records}
-    )
-    union_geometry = unary_union([record["geometry"] for record in records])
+def simplify_buffer_geometry(
+    geometry: dict,
+    target_segments: int = 32,
+) -> dict:
+    """원형 버퍼의 꼭짓점을 줄이고 좌표 정밀도를 정리해 지도 전송량을 줄입니다."""
+    def simplify_ring(ring: list[list[float]]) -> list[list[float]]:
+        if len(ring) < 5:
+            return ring
+        core = ring[:-1] if ring[0] == ring[-1] else ring
+        step = max(1, (len(core) + target_segments - 1) // target_segments)
+        simplified = [
+            [round(float(coordinate[0]), 6), round(float(coordinate[1]), 6)]
+            for coordinate in core[::step]
+        ]
+        if len(simplified) < 3:
+            return ring
+        return [*simplified, simplified[0]]
 
-    def ordered_non_overlapping_partition() -> list[dict]:
-        """동일 좌표 등으로 보로노이 분할이 불가능할 때도 중복 채색을 막습니다."""
-        assigned = None
-        fallback_features = []
-        for record in records:
-            geometry = record["geometry"]
-            piece = geometry if assigned is None else geometry.difference(assigned)
-            if piece.is_empty:
-                continue
-            fallback_feature = dict(record["feature"])
-            fallback_feature["geometry"] = mapping(piece)
-            fallback_features.append(fallback_feature)
-            assigned = (
-                geometry
-                if assigned is None
-                else unary_union([assigned, geometry])
-            )
-        return fallback_features
-
-    if coordinate_count != len(records):
-        return ordered_non_overlapping_partition()
-
-    # 서울 위도에서 경도 1도의 실제 거리가 더 짧은 점을 보정한 뒤 보로노이를 만듭니다.
-    mean_latitude = sum(record["point"].y for record in records) / len(records)
-    longitude_scale = max(
-        float(math.cos(math.radians(mean_latitude))),
-        0.5,
-    )
-    projected_points = [
-        scale(
-            record["point"],
-            xfact=longitude_scale,
-            yfact=1.0,
-            origin=(0.0, 0.0),
-        )
-        for record in records
-    ]
-    projected_union = scale(
-        union_geometry,
-        xfact=longitude_scale,
-        yfact=1.0,
-        origin=(0.0, 0.0),
-    )
-
-    try:
-        cell_collection = voronoi_polygons(
-            MultiPoint(projected_points),
-            extend_to=projected_union.envelope,
-        )
-        unused_cells = list(cell_collection.geoms)
-        partitioned_features = []
-        for record, projected_point in zip(records, projected_points):
-            cell_index = min(
-                range(len(unused_cells)),
-                key=lambda index: unused_cells[index].distance(projected_point),
-            )
-            projected_cell = unused_cells.pop(cell_index)
-            cell = scale(
-                projected_cell,
-                xfact=1.0 / longitude_scale,
-                yfact=1.0,
-                origin=(0.0, 0.0),
-            )
-            piece = record["geometry"].intersection(cell)
-            if piece.is_empty:
-                continue
-            partitioned_feature = dict(record["feature"])
-            partitioned_feature["geometry"] = mapping(piece)
-            partitioned_features.append(partitioned_feature)
-        return partitioned_features
-    except Exception:
-        return ordered_non_overlapping_partition()
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates", [])
+    if geometry_type == "Polygon":
+        simplified_coordinates = [
+            simplify_ring(ring) for ring in coordinates
+        ]
+    elif geometry_type == "MultiPolygon":
+        simplified_coordinates = [
+            [simplify_ring(ring) for ring in polygon]
+            for polygon in coordinates
+        ]
+    else:
+        return geometry
+    return {
+        "type": geometry_type,
+        "coordinates": simplified_coordinates,
+    }
 
 def add_bivariate_buffer_layer(
     parent_group: folium.FeatureGroup,
@@ -579,6 +508,7 @@ def add_bivariate_buffer_layer(
                 "temperature_c": round(float(row[TEMPERATURE_COLUMN]), 2),
                 "cover_level": tertile_label(cover_class),
                 "temperature_level": tertile_label(temperature_class),
+                "display_priority": temperature_class * 3 + cover_class,
                 "bivariate_color": BIVARIATE_COLORS[temperature_class][cover_class],
                 "coverage_pct": round(float(properties.get("coverage_pct", 0)), 2),
                 "selected": serial == selected_serial,
@@ -588,12 +518,17 @@ def add_bivariate_buffer_layer(
             {
                 "type": "Feature",
                 "properties": properties,
-                "geometry": source_feature["geometry"],
+                "geometry": simplify_buffer_geometry(source_feature["geometry"]),
             }
         )
 
-    # 겹친 면적은 최근접 센서 한 곳에만 배정해 전체 버퍼 합집합을 한 번만 칠합니다.
-    features = partition_overlapping_buffers_as_union(features)
+    # 별도 공간연산 없이 고온·고피복 버퍼를 나중에 그려 중첩부를 한 색으로 표시합니다.
+    features.sort(
+        key=lambda feature: (
+            int(feature["properties"]["display_priority"]),
+            bool(feature["properties"]["selected"]),
+        )
+    )
 
     def style_function(feature: dict) -> dict:
         properties = feature["properties"]
@@ -601,7 +536,7 @@ def add_bivariate_buffer_layer(
             "color": "#111827" if properties["selected"] else "transparent",
             "fillColor": properties["bivariate_color"],
             "weight": 4 if properties["selected"] else 0,
-            "fillOpacity": 0.82 if properties["selected"] else 0.72,
+            "fillOpacity": 1.0,
             "dashArray": None,
         }
 
@@ -612,8 +547,9 @@ def add_bivariate_buffer_layer(
         highlight_function=lambda _: {
             "weight": 3,
             "color": "#111827",
-            "fillOpacity": 0.84,
+            "fillOpacity": 1.0,
         },
+        smooth_factor=2.0,
         tooltip=folium.GeoJsonTooltip(
             fields=[
                 "serial",
@@ -1150,7 +1086,7 @@ if selected_buffer_serial and buffer_geojson is not None:
 st.subheader(f"{analysis_cover_name} 비율과 온도의 공간적 관계")
 st.caption(
     f"붉을수록 온도가 높고, 어두울수록 {analysis_cover_name} 비율이 높습니다. "
-    "중첩 영역은 전체 버퍼 합집합 안에서 가장 가까운 센서에 한 번만 배정합니다."
+    "중첩 영역은 고온·고피복 단계의 버퍼 색을 한 번만 표시합니다."
 )
 map_object = build_base_map(center, zoom, selected_basemap)
 
