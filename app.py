@@ -459,6 +459,7 @@ def add_bivariate_buffer_layer(
     allowed_serials: set[str],
     selected_serial: str | None,
     cover_name: str,
+    buffer_opacity: float,
 ) -> int:
     """선택 피복비율과 온도의 3×3 이변량 관계 지도를 추가합니다."""
     composition = build_analysis_composition(stats, min_coverage)
@@ -522,7 +523,7 @@ def add_bivariate_buffer_layer(
             }
         )
 
-    # 별도 공간연산 없이 고온·고피복 버퍼를 나중에 그려 중첩부를 한 색으로 표시합니다.
+    # 고온·고피복 버퍼를 나중에 그려 중첩부에서 반투명 색이 자연스럽게 혼합됩니다.
     features.sort(
         key=lambda feature: (
             int(feature["properties"]["display_priority"]),
@@ -530,13 +531,19 @@ def add_bivariate_buffer_layer(
         )
     )
 
+    normalized_opacity = max(0.20, min(0.90, float(buffer_opacity)))
+
     def style_function(feature: dict) -> dict:
         properties = feature["properties"]
         return {
             "color": "#111827" if properties["selected"] else "transparent",
             "fillColor": properties["bivariate_color"],
             "weight": 4 if properties["selected"] else 0,
-            "fillOpacity": 1.0,
+            "fillOpacity": (
+                min(1.0, normalized_opacity + 0.15)
+                if properties["selected"]
+                else normalized_opacity
+            ),
             "dashArray": None,
         }
 
@@ -547,7 +554,7 @@ def add_bivariate_buffer_layer(
         highlight_function=lambda _: {
             "weight": 3,
             "color": "#111827",
-            "fillOpacity": 1.0,
+            "fillOpacity": min(1.0, normalized_opacity + 0.15),
         },
         smooth_factor=2.0,
         tooltip=folium.GeoJsonTooltip(
@@ -610,6 +617,7 @@ def add_bivariate_buffer_layer(
       <div style="margin:4px 0 0 39px;text-align:center">{escape(cover_name)} 비율 →</div>
       <div style="margin-top:6px;color:#59635f;border-top:1px solid #d7dfdc;padding-top:5px">
         붉을수록 고온 · 어두울수록 피복비율 높음<br>
+        버퍼 투명도 {normalized_opacity:.0%} · 중첩부 색상 혼합<br>
         각 변수 삼분위 · n={len(features)}<br>
         피복 경계 {cover_thresholds[0]:.1f}, {cover_thresholds[1]:.1f}% ·
         온도 경계 {temperature_thresholds[0]:.1f}, {temperature_thresholds[1]:.1f}℃
@@ -960,6 +968,7 @@ buffer_level = "대분류"
 min_buffer_coverage = 50.0
 selected_district = "전체"
 analysis_cover_name = "시가화건조지역"
+buffer_opacity = 0.65
 
 with st.sidebar:
     st.header("지도 설정")
@@ -1013,6 +1022,14 @@ with st.sidebar:
             "관계 지도 피복변수",
             list(ANALYSIS_COVER_COMPONENTS),
             help="녹지는 산림지역과 초지의 합입니다.",
+        )
+        buffer_opacity = st.slider(
+            "버퍼 투명도",
+            0.20,
+            0.90,
+            0.65,
+            0.05,
+            help="값이 낮을수록 배경지도가 더 보이고 중첩부의 색상 혼합이 강조됩니다.",
         )
         buffer_level = st.selectbox(
             "센서 상세보기 분류",
@@ -1086,7 +1103,7 @@ if selected_buffer_serial and buffer_geojson is not None:
 st.subheader(f"{analysis_cover_name} 비율과 온도의 공간적 관계")
 st.caption(
     f"붉을수록 온도가 높고, 어두울수록 {analysis_cover_name} 비율이 높습니다. "
-    "중첩 영역은 고온·고피복 단계의 버퍼 색을 한 번만 표시합니다."
+    "중첩 영역은 반투명 버퍼 색이 겹치며 혼합되어 그라데이션처럼 표시됩니다."
 )
 map_object = build_base_map(center, zoom, selected_basemap)
 
@@ -1121,6 +1138,7 @@ if (
         allowed_serials,
         selected_buffer_serial,
         analysis_cover_name,
+        buffer_opacity,
     )
     relationship_group.add_to(map_object)
 
@@ -1145,6 +1163,7 @@ map_key_parts = [
     str(show_shp),
     str(shp_opacity),
     str(show_temperature_sensors),
+    str(buffer_opacity),
     analysis_cover_name,
     buffer_level,
     str(min_buffer_coverage),
