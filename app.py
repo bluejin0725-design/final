@@ -68,7 +68,6 @@ ANALYSIS_COVER_COLORS = {
 }
 
 # 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
-# 행은 온도(낮음→높음), 열은 선택 피복비율(낮음→높음)입니다.
 # 온도가 높을수록 붉어지고, 피복비율이 높을수록 같은 빨강이 어두워집니다.
 BIVARIATE_COLORS = [
     ["#fff5f0", "#b8b0ad", "#736e6c"],
@@ -478,7 +477,9 @@ def add_bivariate_buffer_layer(
         .set_index("serial")
     )
 
-    analysis = composition[[cover_name]].join(temperature, how="inner")
+    analysis = composition[list(ANALYSIS_COVER_COMPONENTS)].join(
+        temperature, how="inner"
+    )
     analysis = analysis.loc[
         analysis.index.astype(str).isin(allowed_serials)
     ].copy()
@@ -503,6 +504,15 @@ def add_bivariate_buffer_layer(
         row = analysis.loc[serial]
         cover_class = int(row["cover_class"])
         temperature_class = int(row["temperature_class"])
+        composition_items = [
+            {
+                "name": label,
+                "share": round(float(row[label]), 2),
+                "color": ANALYSIS_COVER_COLORS[f"{label}(%)"],
+            }
+            for label in ANALYSIS_COVER_COMPONENTS
+            if float(row[label]) > 0
+        ]
         properties.update(
             {
                 "cover_name": cover_name,
@@ -512,6 +522,10 @@ def add_bivariate_buffer_layer(
                 "temperature_level": tertile_label(temperature_class),
                 "display_priority": temperature_class * 3 + cover_class,
                 "bivariate_color": BIVARIATE_COLORS[temperature_class][cover_class],
+                "composition": composition_items,
+                "composition_total": round(
+                    sum(item["share"] for item in composition_items), 2
+                ),
                 "coverage_pct": round(float(properties.get("coverage_pct", 0)), 2),
                 "selected": serial == selected_serial,
             }
@@ -549,6 +563,70 @@ def add_bivariate_buffer_layer(
             "dashArray": None,
         }
 
+    pie_tooltip = JsCode(
+        """
+        function(feature, layer) {
+            const properties = feature.properties || {};
+            const items = properties.composition || [];
+            let accumulated = 0;
+            const colorStops = items.map(function(item) {
+                const start = accumulated;
+                const share = Math.max(
+                    0,
+                    Math.min(100 - accumulated, Number(item.share || 0))
+                );
+                accumulated += share;
+                return item.color + " " + start.toFixed(2) + "% "
+                    + accumulated.toFixed(2) + "%";
+            });
+            if (accumulated < 100) {
+                colorStops.push(
+                    "#e5e7eb " + accumulated.toFixed(2) + "% 100%"
+                );
+            }
+            const pieBackground = "conic-gradient("
+                + colorStops.join(",") + ")";
+            const legendRows = items.map(function(item) {
+                return '<div style="display:grid;grid-template-columns:12px 1fr auto;gap:7px;'
+                    + 'align-items:center;margin:4px 0">'
+                    + '<span style="width:11px;height:11px;border-radius:2px;background:'
+                    + item.color + '"></span><span>' + item.name + '</span>'
+                    + '<b style="font-variant-numeric:tabular-nums">'
+                    + Number(item.share).toFixed(1) + '%</b></div>';
+            }).join("");
+            const tooltipHtml = '<div style="width:320px;color:#18201e;font:12px/1.4 sans-serif">'
+                + '<div style="font-size:13px;font-weight:700;margin-bottom:3px">'
+                + properties.serial + ' · 300m 분석대상 피복 구성비</div>'
+                + '<div style="color:#59635f;margin-bottom:8px;white-space:normal">'
+                + (properties.address || '') + '</div>'
+                + '<div style="display:grid;grid-template-columns:118px 1fr;gap:13px;align-items:center">'
+                + '<div style="width:112px;height:112px;border-radius:50%;background:'
+                + pieBackground
+                + ';box-shadow:inset 0 0 0 1px rgba(0,0,0,.12)"></div>'
+                + '<div>' + legendRows + '</div></div>'
+                + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;'
+                + 'padding-top:7px;border-top:1px solid #d7dfdc">'
+                + '<span>' + properties.cover_name + ' <b>'
+                + Number(properties.cover_share).toFixed(1) + '%</b> ('
+                + properties.cover_level + ')</span><span>온도 <b>'
+                + Number(properties.temperature_c).toFixed(1) + '℃</b> ('
+                + properties.temperature_level + ')</span></div>'
+                + '<div style="margin-top:5px;color:#6b7280">SHP 피복률 '
+                + Number(properties.coverage_pct).toFixed(1)
+                + '% · 회색: 분석 제외 피복 · 표시 비율 합계 '
+                + Number(properties.composition_total).toFixed(1)
+                + '%</div></div>';
+            layer.bindTooltip(tooltipHtml, {
+                sticky: true,
+                direction: "auto",
+                opacity: 0.97,
+                maxWidth: 360,
+                className: "landcover-pie-tooltip"
+            });
+        }
+        """
+    )
+
     folium.GeoJson(
         {"type": "FeatureCollection", "features": features},
         name=f"{cover_name} × 온도",
@@ -559,28 +637,7 @@ def add_bivariate_buffer_layer(
             "fillOpacity": min(1.0, normal_fill_opacity + 0.15),
         },
         smooth_factor=2.0,
-        tooltip=folium.GeoJsonTooltip(
-            fields=[
-                "serial",
-                "address",
-                "cover_share",
-                "temperature_c",
-                "cover_level",
-                "temperature_level",
-                "coverage_pct",
-            ],
-            aliases=[
-                "센서",
-                "주소",
-                f"{cover_name} 비율(%)",
-                "온도(℃)",
-                f"{cover_name} 삼분위",
-                "온도 삼분위",
-                "SHP 피복률(%)",
-            ],
-            localize=True,
-            sticky=True,
-        ),
+        on_each_feature=pie_tooltip,
         popup=folium.GeoJsonPopup(
             fields=["serial", "cover_share", "temperature_c"],
             aliases=["센서", f"{cover_name} 비율(%)", "온도(℃)"],
